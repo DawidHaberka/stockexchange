@@ -1,0 +1,14 @@
+# Crontab dla VM (crontab -e). Czas: America/New_York.
+# Na Debianie/Ubuntu cron używa strefy systemowej — ustaw ją raz:
+#   sudo timedatectl set-timezone America/New_York
+# (CRON_TZ działa tylko w cronie typu cronie; na Debianie jest ignorowane, stąd timedatectl.)
+CRON_TZ=America/New_York
+SHELL=/bin/bash
+
+# Co 15 min w godzinach 9:00–15:45 NY, pn–pt. Program sam sprawdza zegar Alpaca,
+# godziny sesji (10:00 … zamknięcie-30 min) i czy bieżący slot (1h/30min/15min z config.yaml)
+# był już przetworzony — zmiana częstotliwości nie wymaga zmiany crona.
+*/15 9-15 * * 1-5  $HOME/stockexchange/deploy/run.sh --run
+
+# Raport dzienny po zamknięciu sesji.
+20 16 * * 1-5      $HOME/stockexchange/deploy/run.sh --report

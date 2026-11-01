@@ -1,0 +1,21 @@
+# Sekrety — NIGDY nie commitować
+.env
+.env.*
+!.env.example
+
+# Dane runtime (baza, raporty, logi)
+runtime/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Edytory / OS
+.idea/
+.vscode/
+.DS_Store

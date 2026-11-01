@@ -1,0 +1,28 @@
+[project]
+name = "llm-paper-trader"
+version = "0.1.0"
+description = "Eksperyment badawczy: czy LLM podejmuje lepsze decyzje inwestycyjne niż benchmark (wyłącznie paper trading)."
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.44",
+    "anthropic>=2.3",
+    "pydantic>=2.7",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "matplotlib>=3.8",
+    "backtesting>=0.6",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+dashboard = ["streamlit>=1.50"]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["trader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
