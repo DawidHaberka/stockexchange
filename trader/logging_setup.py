@@ -22,5 +22,5 @@ def setup_logging(log_dir: str | Path, verbose: bool = False) -> None:
     fh.setFormatter(fmt)
     root.addHandler(fh)
     # biblioteki HTTP są gadatliwe
-    for noisy in ("httpx", "httpx2", "urllib3", "anthropic", "matplotlib"):
+    for noisy in ("urllib3", "matplotlib", "PIL"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

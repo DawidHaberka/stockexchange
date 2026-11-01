@@ -2,7 +2,7 @@
 """Eksperymentalny agent tradingowy LLM vs SMA vs SPY — WYŁĄCZNIE Alpaca Paper.
 
 Przykłady:
-  python main.py --check                 # połączenia z oboma kontami, dane, Claude API
+  python main.py --check                 # połączenia z oboma kontami, dane, Claude Code CLI
   python main.py --dry-run               # pełny przebieg bez wysyłania zleceń
   python main.py --dry-run --force       # j.w., ale ignoruje harmonogram (np. poza sesją)
   python main.py --run                   # przebieg wg harmonogramu (zlecenia tylko gdy orders_enabled)
@@ -71,6 +71,15 @@ def build_market_data(cfg, secrets):
     return AlpacaMarketData(creds, cfg.data.feed)
 
 
+def build_llm_cli(cfg):
+    from pathlib import Path
+
+    from trader.agent.claude_cli import ClaudeCLI
+
+    # pusty katalog roboczy: Claude Code nie wczyta CLAUDE.md ani ustawień projektu
+    return ClaudeCLI(cfg.llm, Path(cfg.storage.db_path).parent / "llm_workdir")
+
+
 def open_db(cfg):
     from trader.storage.db import Database
 
@@ -79,14 +88,13 @@ def open_db(cfg):
 
 # --------------------------------------------------------------------------- commands
 def cmd_run(cfg, secrets, args) -> int:
-    from trader.agent.llm_agent import make_anthropic_client
     from trader.runner import Runner
 
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
     brokers = build_brokers(cfg, secrets, agents)
-    llm_client = make_anthropic_client(cfg, secrets.anthropic_api_key) if "llm" in agents else None
+    llm_cli = build_llm_cli(cfg) if "llm" in agents else None
     db = open_db(cfg)
-    runner = Runner(cfg, db, brokers, build_market_data(cfg, secrets), llm_client)
+    runner = Runner(cfg, db, brokers, build_market_data(cfg, secrets), llm_cli)
     summary = runner.run(dry_run=args.dry_run, force=args.force, agents=agents)
     print_run_summary(summary)
     return 0 if summary.status in ("ok", "skipped") else 1
@@ -97,7 +105,8 @@ def print_run_summary(s) -> None:
     print(f"=== PODSUMOWANIE PRZEBIEGU: {s.status.upper()} ({s.mode}) — {s.reason}")
     if s.run_id is None:
         return
-    print(f"run_id={s.run_id}  wywołania Claude: {s.llm_calls}  koszt: {s.llm_cost_usd:.4f} USD")
+    print(f"run_id={s.run_id}  wywołania Claude: {s.llm_calls}  "
+          f"(równoważnik cen API: {s.llm_cost_equiv_usd:.4f} USD — nie jest pobierany przy subskrypcji)")
     if s.data_problems:
         print("Problemy z danymi: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in s.data_problems.items()))
     for name, r in s.agents.items():
@@ -177,18 +186,45 @@ def cmd_check(cfg, secrets, args) -> int:
         ok = False
         print(f"Dane: BŁĄD {type(exc).__name__}: {exc}")
     if "llm" in agents:
-        try:
-            from trader.agent.llm_agent import make_anthropic_client
-
-            client = make_anthropic_client(cfg, secrets.anthropic_api_key)
-            m = client.models.retrieve(cfg.llm.model)
-            priced = cfg.pricing_for(cfg.llm.model) is not None
-            print(f"Claude API: model {m.id} dostępny{'' if priced else ' — UWAGA: brak cennika w config.yaml'}")
-        except Exception as exc:
-            ok = False
-            print(f"Claude API: BŁĄD {type(exc).__name__}: {exc}")
+        ok = check_claude_cli(cfg) and ok
     print("WYNIK: OK" if ok else "WYNIK: SĄ PROBLEMY (patrz wyżej)")
     return 0 if ok else 1
+
+
+def check_claude_cli(cfg) -> bool:
+    """Claude Code CLI: instalacja, logowanie subskrypcją i jedno testowe wywołanie (effort=low)."""
+    import json
+
+    from trader.agent.schemas import DECISION_JSON_SCHEMA, parse_decision
+
+    cli = build_llm_cli(cfg)
+    version = cli.version()
+    if not version:
+        print(f"Claude Code: BŁĄD — nie znaleziono '{cfg.llm.cli_path}'. Zainstaluj Claude Code (README).")
+        return False
+    auth = cli.auth_status() or {}
+    method = str(auth.get("authMethod", ""))
+    print(f"Claude Code: {version} | zalogowany={auth.get('loggedIn')} metoda={method or 'n/a'}")
+    if not auth.get("loggedIn"):
+        print("Claude Code: BŁĄD — niezalogowany. Uruchom `claude auth login` (konto z subskrypcją Claude).")
+        return False
+    if "api" in method.lower() and "key" in method.lower():
+        print("Claude Code: BŁĄD — logowanie kluczem API (płatne). Zaloguj się kontem z subskrypcją: "
+              "`claude auth logout` i `claude auth login`.")
+        return False
+    res = cli.ask("Ticker: TEST\nThis is a connectivity test. Return HOLD for TEST with size_pct 0, "
+                  "confidence 0 and reasoning 'test'.", DECISION_JSON_SCHEMA, effort="low")
+    if not res.ok:
+        print(f"Claude Code: BŁĄD testowego wywołania modelu {cfg.llm.model}: {res.error}")
+        return False
+    raw = json.dumps(res.structured) if res.structured is not None else res.text
+    _, err = parse_decision(raw, "TEST")
+    if err:
+        print(f"Claude Code: BŁĄD — odpowiedź nie przeszła walidacji: {err}")
+        return False
+    print(f"Claude Code: testowe wywołanie OK — model {res.model_served}, {res.duration_ms} ms, "
+          f"równoważnik cen API {res.cost_equiv_usd:.4f} USD (przy subskrypcji nie jest pobierany)")
+    return True
 
 
 def cmd_report(cfg, secrets, args) -> int:

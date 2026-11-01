@@ -5,7 +5,6 @@ description = "Eksperyment badawczy: czy LLM podejmuje lepsze decyzje inwestycyj
 requires-python = ">=3.11"
 dependencies = [
     "alpaca-py>=0.44",
-    "anthropic>=2.3",
     "pydantic>=2.7",
     "pandas>=2.2",
     "numpy>=1.26",

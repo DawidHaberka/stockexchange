@@ -56,12 +56,14 @@ class TriggerCfg(_Strict):
 
 
 class LLMCfg(_Strict):
+    """Claude wywoływany przez Claude Code CLI (`claude -p`) na subskrypcji — bez płatnego API."""
+
+    cli_path: str = "claude"
     model: str
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
-    max_tokens: int = Field(16000, ge=256)
     timeout_s: float = Field(300, gt=0)
-    max_retries: int = Field(2, ge=0)
-    refusal_fallback: bool = True
+    max_retries: int = Field(1, ge=0)
+    cli_extra_args: list[str] = ["--safe-mode", "--strict-mcp-config"]
     system_prompt: str
 
     @field_validator("system_prompt")
@@ -74,13 +76,6 @@ class LLMCfg(_Strict):
     @property
     def prompt_hash(self) -> str:
         return hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest()[:16]
-
-
-class Pricing(_Strict):
-    input: float
-    output: float
-    cache_write: float
-    cache_read: float
 
 
 class SMACfg(_Strict):
@@ -130,7 +125,6 @@ class AppConfig(_Strict):
     data: DataCfg = DataCfg()
     triggers: TriggerCfg = TriggerCfg()
     llm: LLMCfg
-    pricing_usd_per_mtok: dict[str, Pricing] = {}
     sma: SMACfg = SMACfg()
     risk: RiskCfg = RiskCfg()
     execution: ExecutionCfg = ExecutionCfg()
@@ -174,9 +168,6 @@ class AppConfig(_Strict):
             "config_hash": self.config_hash,
         }
 
-    def pricing_for(self, model: str) -> Pricing | None:
-        return self.pricing_usd_per_mtok.get(model)
-
 
 @dataclass(frozen=True)
 class AlpacaCredentials:
@@ -189,7 +180,6 @@ class AlpacaCredentials:
 class Secrets:
     alpaca_base_url: str
     accounts: dict[str, AlpacaCredentials]
-    anthropic_api_key: str | None
 
 
 class ConfigError(RuntimeError):
@@ -221,5 +211,4 @@ def load_secrets(cfg: AppConfig, env_file: str | Path | None = ".env") -> Secret
         if key and secret:
             accounts[agent_name] = AlpacaCredentials(key, secret, base_url)
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
-    return Secrets(alpaca_base_url=base_url, accounts=accounts, anthropic_api_key=anthropic_key)
+    return Secrets(alpaca_base_url=base_url, accounts=accounts)

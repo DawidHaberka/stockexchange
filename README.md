@@ -6,7 +6,9 @@ BUY / SELL / HOLD dla stałej watchlisty, a wynik jest porównywany z:
 - **agentem bazowym SMA 20/50** (crossover na świecach 1H, te same dane, ta sama częstotliwość, ten sam risk manager),
 - **buy-and-hold SPY** od tego samego momentu startu.
 
-Wynik LLM jest liczony **netto** — po odjęciu kosztu wszystkich wywołań Claude API.
+**Bez płatnego API.** Claude jest wywoływany przez **Claude Code CLI** (`claude -p`) zalogowany kontem
+z subskrypcją Claude (Pro/Max). Wywołania nie są płatne per token — zużywają limity planu. Raport pokazuje
+dodatkowo „równoważnik cen API”, czyli ile kosztowałyby te same wywołania przez płatne API.
 
 > ⚠️ **Wyłącznie paper trading.** Program obsługuje tylko `https://paper-api.alpaca.markets`.
 > Każdy inny URL (w tym konto live `api.alpaca.markets`) zatrzymuje program z błędem, zanim
@@ -16,17 +18,18 @@ Wynik LLM jest liczony **netto** — po odjęciu kosztu wszystkich wywołań Cla
 
 ## Spis treści
 1. [Architektura](#architektura)
-2. [Setup](#setup)
-3. [Pierwsze uruchomienie (dry-run)](#pierwsze-uruchomienie-dry-run)
-4. [Włączenie zleceń](#włączenie-zleceń)
-5. [Wdrożenie na GCP e2-micro z cronem](#wdrożenie-na-gcp-e2-micro-z-cronem)
-6. [Konfiguracja i warianty eksperymentu](#konfiguracja-i-warianty-eksperymentu)
-7. [Risk manager](#risk-manager)
-8. [Raport — jak go czytać](#raport--jak-go-czytać)
-9. [Dashboard](#dashboard)
-10. [Backtest (tylko SMA)](#backtest-tylko-sma)
-11. [Testy](#testy)
-12. [Ograniczenia metodologiczne](#ograniczenia-metodologiczne)
+2. [Koszty](#koszty)
+3. [Setup](#setup)
+4. [Pierwsze uruchomienie (dry-run)](#pierwsze-uruchomienie-dry-run)
+5. [Włączenie zleceń](#włączenie-zleceń)
+6. [Wdrożenie na GCP e2-micro z cronem](#wdrożenie-na-gcp-e2-micro-z-cronem)
+7. [Konfiguracja i warianty eksperymentu](#konfiguracja-i-warianty-eksperymentu)
+8. [Risk manager](#risk-manager)
+9. [Raport — jak go czytać](#raport--jak-go-czytać)
+10. [Dashboard](#dashboard)
+11. [Backtest (tylko SMA)](#backtest-tylko-sma)
+12. [Testy](#testy)
+13. [Ograniczenia metodologiczne](#ograniczenia-metodologiczne)
 
 ---
 
@@ -35,8 +38,8 @@ Wynik LLM jest liczony **netto** — po odjęciu kosztu wszystkich wywołań Cla
 ```
 main.py                     CLI: --check | --run | --dry-run [--force] | --report | --backtest-sma
 config.yaml                 watchlista, wariant (model/effort/częstotliwość/prompt), triggery, ryzyko, zlecenia
-.env                        klucze (NIE w repo; wzór: .env.example)
-deploy/run.sh               wrapper dla crona (venv + flock + log)
+.env                        klucze Alpaca (NIE w repo; wzór: .env.example)
+deploy/run.sh               wrapper dla crona (venv + PATH z Claude Code + flock + log)
 deploy/crontab.example      harmonogram w strefie America/New_York
 trader/
   safety.py                 twardy guard: tylko Alpaca Paper URL
@@ -45,13 +48,13 @@ trader/
   scheduler.py              czy bieżący slot (1h/30min/15min) jest należny
   runner.py                 orkiestracja jednego przebiegu
   data/                     świece 1H i 1D, kwotowania, newsy (Alpaca), wskaźniki SMA/RSI/ATR/wolumen
-  agent/                    agent LLM (Claude) + triggery + kontekst; agent SMA; schemat decyzji (pydantic)
+  agent/                    agent LLM + Claude Code CLI + triggery + kontekst; agent SMA; schemat decyzji (pydantic)
   risk/                     risk manager — ostatnie słowo nad agentami
   execution/                zlecenia limit, częściowe realizacje, odrzucenia, stop-lossy, rekoncyliacja
-  storage/                  SQLite: decyzje, zlecenia, transakcje, stan portfela, koszt tokenów
+  storage/                  SQLite: decyzje, zlecenia, transakcje, stan portfela, tokeny każdego wywołania
   evaluation/               metryki, raport dzienny, backtest SMA
   dashboard/app.py          Streamlit (tylko odczyt bazy)
-tests/                      pytest — wszystkie API zamockowane
+tests/                      pytest — Alpaca i Claude zamockowane
 ```
 
 ### Przebieg (`main.py --run`, wywoływany przez crona co 15 min)
@@ -68,9 +71,25 @@ tests/                      pytest — wszystkie API zamockowane
    4. decyzje agenta → **risk manager** → zapis do bazy → wykonanie (lub symulacja w dry-run),
    5. zapis stanu konta po przebiegu.
 
-### Agent LLM — kiedy płacimy za API
+### Agent LLM — jak wywołujemy Claude
 
-Claude jest wywoływany **tylko** dla tickerów z triggerem (progi w `config.yaml → triggers`):
+Dla każdego tickera z triggerem program uruchamia:
+
+```
+claude -p --output-format json --model <model> --effort <effort> --system-prompt <prompt z config>
+       --json-schema <schemat decyzji> --tools "" --no-session-persistence --safe-mode --strict-mcp-config
+```
+
+- prompt (kontekst tickera) idzie przez stdin, wynik wraca jako jeden obiekt JSON,
+- `--json-schema` wymusza format `{ticker, action, size_pct, confidence, reasoning}`, a pydantic waliduje go
+  drugi raz — **każda niepoprawna odpowiedź, odmowa, błąd lub timeout = HOLD** (z zapisanym powodem),
+- `--tools ""` — model nie ma żadnych narzędzi (nie czyta plików, nie szuka w sieci), ocenia tylko podany kontekst,
+- `--safe-mode --strict-mcp-config` i pusty katalog roboczy (`runtime/llm_workdir`) — bez CLAUDE.md, hooków,
+  pluginów i serwerów MCP, żeby wariant był powtarzalny,
+- zmienne `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` są usuwane ze środowiska procesu, więc Claude Code
+  **zawsze** używa subskrypcji, nigdy płatnego klucza API.
+
+Model jest wywoływany **tylko** dla tickerów z triggerem (progi w `config.yaml → triggers`):
 
 | Trigger | Warunek |
 |---|---|
@@ -79,20 +98,32 @@ Claude jest wywoływany **tylko** dla tickerów z triggerem (progi w `config.yam
 | `price_move:k×ATR1H` | \|cena − cena z poprzedniego uruchomienia\| > `price_move_atr_mult` × ATR(1H) |
 | `near_stop:k×ATR1H` | pozycja i (cena − stop) ≤ `near_stop_atr_mult` × ATR(1H) |
 
-Pozostałe tickery dostają HOLD bez wywołania API (w logu i bazie: `source = no_trigger`, uzasadnienie `"no trigger"`).
+Pozostałe tickery dostają HOLD bez wywołania (w logu i bazie: `source = no_trigger`, uzasadnienie `"no trigger"`).
+Newsy trafiają do promptu jako niezaufane dane w znacznikach `<news>` (z zneutralizowanymi `<`/`>`).
 
-Odpowiedź modelu to ściśle określony JSON `{ticker, action, size_pct, confidence, reasoning}` — wymuszony przez
-*structured outputs* API, a potem walidowany pydantic. **Każda niepoprawna odpowiedź, odmowa, ucięcie lub błąd API = HOLD**
-(z zapisanym powodem). Newsy trafiają do promptu jako niezaufane dane w znacznikach `<news>` (z zneutralizowanymi `<`/`>`).
-
-Każde wywołanie trafia do `llm_calls`: tokeny (wejście, wyjście z myśleniem, zapis/odczyt cache), koszt USD
-wg cennika z `config.yaml`, model faktycznie użyty, czas, `request_id`, pełny prompt i surowa odpowiedź.
+Każde wywołanie trafia do `llm_calls`: model zamówiony i faktycznie użyty, effort, hash promptu, tokeny
+(wejście, wyjście z myśleniem, zapis/odczyt cache), równoważnik ceny API, czas, identyfikator, pełny prompt,
+surowa odpowiedź i ewentualny błąd.
 
 ### Agent SMA (bazowy)
 
 Na świecach 1H: `SMA20 > SMA50` → trzymaj pozycję 10% equity; `SMA20 ≤ SMA50` → zamknij. Gdy kandydatów do kupna
 jest więcej niż wolnych miejsc (max 5 pozycji), pierwszeństwo ma największa różnica średnich. Przechodzi przez
 ten sam risk manager i to samo wykonanie co LLM — na **osobnym koncie paper**.
+
+---
+
+## Koszty
+
+| Element | Koszt |
+|---|---|
+| Alpaca paper + dane IEX | 0 zł |
+| Claude | w ramach Twojej subskrypcji Claude (Pro/Max) — bez kredytów API; zużywa limity planu |
+| GCP e2-micro | w ramach free tier zwykle 0 zł (sprawdź billing w GCP) |
+
+Orientacyjnie: jedno wywołanie Opus to kilka–kilkanaście sekund. Przy `frequency: 1h` i dużych spółkach
+(częste newsy) spodziewaj się ok. 25–45 wywołań dziennie. Jeśli limity planu się kończą (błąd `llm_error` w logu,
+np. HTTP 429), agent daje HOLD — obniż `llm.effort`, zmień model na `claude-sonnet-5-5` albo zaostrz triggery.
 
 ---
 
@@ -105,21 +136,42 @@ gdy obaj trzymają np. AAPL).
 
 1. Zaloguj się na <https://app.alpaca.markets>, przełącz na **Paper Trading**.
 2. Utwórz drugie konto paper (przełącznik kont → *Open New Paper Account*).
-3. Na **obu** kontach zresetuj saldo do **$10 000** (ustawienia konta paper → *Reset Account*, kwota 10000).
-4. Na każdym koncie wygeneruj klucze API (*API Keys → Generate*). To są klucze paper — klucze live nie są potrzebne.
+3. Na **obu** kontach ustaw saldo **$10 000** (ustawienia konta paper → *Reset Account*, kwota 10000).
+4. Na każdym koncie wygeneruj klucze API (*API Keys → Generate New Keys*). To są klucze paper.
 
 Kapitał startowy **nie jest zakładany** w kodzie — program odczytuje `equity` z każdego konta przy pierwszym
 przebiegu z włączonymi zleceniami i zapisuje go w tabeli `experiment_start`. `--check` ostrzega, jeśli konta mają
 różne salda albo jeśli oba klucze wskazują to samo konto.
 
-### 2. Klucz Claude API
+### 2. Claude Code zalogowany subskrypcją
 
-<https://console.anthropic.com> → *API Keys*. Domyślny model: `claude-opus-5-5` (zmiana w `config.yaml`).
-
-### 3. Instalacja
+Na maszynie, na której działa cron (np. VM):
 
 ```bash
-git clone https://github.com/dawidhaberka/stockexchange.git
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+```bash
+claude auth login
+```
+
+Logowanie wyświetli link — otwórz go w przeglądarce, zaloguj się kontem Claude z subskrypcją i wklej kod
+z powrotem w terminalu. Sprawdzenie:
+
+```bash
+claude auth status
+```
+
+Alternatywa bez interaktywnego logowania: `claude setup-token` (na dowolnym komputerze, wymaga subskrypcji)
+i wpisanie tokenu do `.env` jako `CLAUDE_CODE_OAUTH_TOKEN=...`.
+
+**Nie ustawiaj `ANTHROPIC_API_KEY`** — program i tak go usuwa przed uruchomieniem `claude`, a `--check`
+odrzuca logowanie kluczem API.
+
+### 3. Instalacja projektu
+
+```bash
+git clone https://github.com/DawidHaberka/stockexchange.git
 ```
 
 ```bash
@@ -138,7 +190,6 @@ ALPACA_LLM_API_KEY=...      # konto paper #1 (agent LLM)
 ALPACA_LLM_SECRET_KEY=...
 ALPACA_SMA_API_KEY=...      # konto paper #2 (agent SMA)
 ALPACA_SMA_SECRET_KEY=...
-ANTHROPIC_API_KEY=...
 ```
 
 `.env` jest w `.gitignore`. Klucze nigdy nie są logowane.
@@ -154,14 +205,15 @@ Domyślnie `execution.orders_enabled: false` — **nawet `--run` nie wyśle wted
 ```
 
 Sprawdza: paper URL, połączenie z oboma kontami (numer, equity, cash, blokady, pozycje, otwarte zlecenia),
-zegar i kalendarz sesji, dane (świece 1H/1D, quote, newsy) i dostęp do modelu Claude (bez płatnego wywołania).
+zegar i kalendarz sesji, dane (świece 1H/1D, quote, newsy) oraz Claude Code: instalację, logowanie subskrypcją
+i jedno testowe wywołanie skonfigurowanego modelu (effort `low`, walidacja odpowiedzi).
 
 ```bash
 .venv/bin/python main.py --dry-run
 ```
 
 Pełny przebieg wg harmonogramu — wszystko poza wysłaniem zleceń: dane, decyzje obu agentów (LLM naprawdę
-wywołuje Claude, więc kosztuje), werdykty risk managera, zapis do bazy z flagą `dry_run=1`, symulowane zlecenia.
+wywołuje Claude), werdykty risk managera, zapis do bazy z flagą `dry_run=1`, symulowane zlecenia.
 Poza godzinami sesji przebieg zostanie pominięty — wtedy:
 
 ```bash
@@ -197,7 +249,7 @@ startowy obu kont i cenę SPY (start benchmarku).
 e2-micro (1 vCPU współdzielony, 1 GB RAM) wystarcza; darmowy tier obejmuje regiony `us-west1`, `us-central1`, `us-east1`.
 
 1. VM z Debianem 12, dostęp przez SSH (`gcloud compute ssh <vm>`).
-2. Swap (1 GB RAM bywa za mało przy `pip install`):
+2. Swap (1 GB RAM to mało dla `pip install` i Claude Code jednocześnie):
 
    ```bash
    sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile && echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
@@ -209,14 +261,16 @@ e2-micro (1 vCPU współdzielony, 1 GB RAM) wystarcza; darmowy tier obejmuje reg
    sudo timedatectl set-timezone America/New_York
    ```
 
-4. Python i repo:
+4. Python, git i curl:
 
    ```bash
-   sudo apt-get update && sudo apt-get install -y python3-venv git
+   sudo apt-get update && sudo apt-get install -y python3-venv git curl
    ```
 
-   Dalej jak w [Instalacji](#3-instalacja), w katalogu `~/stockexchange`.
-5. Cron — skopiuj `deploy/crontab.example` (`crontab -e`):
+5. Claude Code + logowanie ([Setup, krok 2](#2-claude-code-zalogowany-subskrypcją)) i projekt
+   ([krok 3](#3-instalacja-projektu)) w katalogu `~/stockexchange`. Jeśli `which claude` pokazuje inną ścieżkę niż
+   `~/.local/bin`, `~/.npm-global/bin` lub `/usr/local/bin`, wpisz ją w `config.yaml → llm.cli_path`.
+6. Cron — skopiuj `deploy/crontab.example` (`crontab -e`):
 
    ```cron
    */15 9-15 * * 1-5  $HOME/stockexchange/deploy/run.sh --run
@@ -224,9 +278,9 @@ e2-micro (1 vCPU współdzielony, 1 GB RAM) wystarcza; darmowy tier obejmuje reg
    ```
 
    Cron odpala program co 15 min; program sam decyduje, czy slot jest należny (zegar Alpaca, święta, skrócone
-   sesje, `frequency` z configu). `deploy/run.sh` używa `flock`, więc przebiegi się nie nakładają.
-   Logi: `runtime/logs/trader.log` (aplikacja, rotowany) i `runtime/logs/cron.log` (stdout crona).
-6. Kopia zapasowa bazy (opcjonalnie, np. raz dziennie do GCS):
+   sesje, `frequency` z configu). `deploy/run.sh` dodaje Claude Code do `PATH` i używa `flock`, więc przebiegi
+   się nie nakładają. Logi: `runtime/logs/trader.log` (aplikacja, rotowany) i `runtime/logs/cron.log`.
+7. Kopia zapasowa bazy (opcjonalnie, np. raz dziennie do GCS):
 
    ```bash
    sqlite3 ~/stockexchange/runtime/trader.db ".backup '/tmp/trader.db'" && gsutil cp /tmp/trader.db gs://<bucket>/trader-$(date +%F).db
@@ -244,17 +298,18 @@ po wariancie.
 | Klucz | Znaczenie |
 |---|---|
 | `experiment.frequency` | `1h` / `30min` / `15min` — co ile agent podejmuje decyzje w sesji |
-| `llm.model` | np. `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` (+ cennik w `pricing_usd_per_mtok`) |
-| `llm.effort` | `low` / `medium` / `high` / `xhigh` / `max` — głębokość rozumowania i koszt |
+| `llm.model` | pełna nazwa, np. `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` (alias typu `opus` przesuwa się przy nowych wersjach) |
+| `llm.effort` | `low` / `medium` / `high` / `xhigh` / `max` — głębokość rozumowania (i zużycie limitu) |
 | `llm.system_prompt` | prompt systemowy (zmiana = nowy `prompt_hash`) |
-| `llm.refusal_fallback` | server-side fallback przy odmowie modelu; faktyczny model w `llm_calls.model_served` |
+| `llm.cli_path` | ścieżka do programu `claude` |
+| `llm.cli_extra_args` | dodatkowe flagi CLI (domyślnie `--safe-mode --strict-mcp-config`) |
+| `llm.timeout_s`, `llm.max_retries` | limit czasu wywołania; ponowienia przy 429/5xx/timeout |
 | `triggers.*` | progi wywołania LLM |
 | `risk.*` | limity risk managera |
 | `execution.*` | bezpiecznik `orders_enabled`, offset ceny limit, timeout realizacji |
 
-**Dlaczego nie ma `temperature`?** Bieżąca wersja Claude API (2026-10-21) odrzuca `temperature`/`top_p`/`top_k`
-błędem 400 na każdym modelu, a modele 4.7+ i tak przyjmowały tylko wartość domyślną. Odpowiednikiem
-„pokrętła” do porównań jest `effort`.
+**Dlaczego nie ma `temperature`?** Ani Claude Code CLI, ani bieżąca wersja Claude API nie pozwalają jej
+ustawić. Odpowiednikiem „pokrętła” do porównań jest `effort`.
 
 **Porównywanie wariantów:** zmiana wariantu w trakcie eksperymentu miesza wyniki na tych samych kontach.
 Czysty sposób: dla nowego wariantu zresetuj oba konta paper do $10 000 i ustaw nowy `storage.db_path`
@@ -300,20 +355,20 @@ obejmuje tylko faktycznie posiadaną ilość. Odrzucenia brokera są zapisywane 
 | Metryka | Co oznacza |
 |---|---|
 | Kapitał startowy / bieżący | equity konta przy starcie live / teraz; SPY = zakup SPY za kapitał startowy LLM |
-| Total return brutto | zmiana equity od startu |
-| Koszt API | suma kosztu wywołań Claude w przebiegach **live** od startu (dry-run pokazany osobno) |
-| **Wynik netto** | zysk − koszt API. **Główna miara**: czy LLM zarabia na siebie |
+| Wynik / Total return | zmiana equity od startu (LLM na subskrypcji — bez kosztu za wywołania) |
+| Równoważnik cen API LLM | ile kosztowałyby wywołania Claude w przebiegach **live** przez płatne API (z Claude Code) |
+| **Wynik przy cenach API** | wynik − równoważnik: czy LLM „zarabiałby na siebie”, gdyby płacić za każde wywołanie |
 | Sharpe (ann.) | z dziennych zmian equity, √252, rf z `report.risk_free_rate_annual` |
 | Max drawdown | największy spadek od szczytu equity |
 | Win rate | % zamkniętych sprzedaży (parowanie FIFO) z dodatnim wynikiem |
 | Liczba transakcji | liczba realizacji (w tym stop-lossów) |
 
 Wskazówki interpretacyjne:
-- **Kilka dni to szum.** Sharpe i win rate z < ~60 sesji są bardzo niestabilne; porównuj netto vs SPY dopiero po
+- **Kilka dni to szum.** Sharpe i win rate z < ~60 sesji są bardzo niestabilne; porównuj z SPY dopiero po
   kilku miesiącach i patrz na drawdown, nie tylko zwrot.
-- LLM, który bije SMA, ale przegrywa z SPY netto, nie dodaje wartości ponad pasywny indeks.
-- Wysoki koszt API przy małej liczbie transakcji → zaostrz triggery albo obniż `effort`/zmień model.
-- Przy $10 000 kapitału koszt API ma realny wpływ: np. $8/mies. to ~0,08% kapitału miesięcznie.
+- LLM, który bije SMA, ale przegrywa z SPY, nie dodaje wartości ponad pasywny indeks.
+- Duży „równoważnik cen API” przy małej liczbie transakcji → model jest pytany za często; zaostrz triggery
+  albo obniż `effort` (to też oszczędza limity planu).
 
 ---
 
@@ -330,8 +385,8 @@ gcloud compute ssh <vm> -- -L 8501:127.0.0.1:8501
 ```
 
 i otwórz <http://localhost:8501>. Zawiera: tabelę metryk LLM/SMA/SPY, equity curve, log decyzji z filtrami
-i rozwijanymi uzasadnieniami (z triggerami, werdyktem risk managera i wariantem), koszty API dziennie i wg wariantu,
-zlecenia, transakcje i wersje konfiguracji.
+i rozwijanymi uzasadnieniami (z triggerami, werdyktem risk managera i wariantem), wywołania Claude dziennie
+i wg wariantu, zlecenia, transakcje i wersje konfiguracji.
 
 ---
 
@@ -354,10 +409,12 @@ Uwaga: backtesting.py testuje jeden instrument naraz, więc limit 5 pozycji i ws
 .venv/bin/python -m pytest
 ```
 
-Wszystkie API (Alpaca, Claude) są zamockowane (`tests/conftest.py`). Pokrycie m.in.: guard paper URL, walidacja
-JSON decyzji (niepoprawna = HOLD), każda reguła risk managera, agent LLM (błędy API, odmowy, ucięcia, triggery,
-koszt), harmonogram slotów, egzekucja (pełne/częściowe/brak realizacji, odrzucenia, stop-lossy, rekoncyliacja),
-metryki i pełne przebiegi dry-run/live z raportem.
+Bez sieci i bez kont. Alpaca jest zamockowana na poziomie HTTP (prawdziwe alpaca-py parsuje odpowiedzi w formacie
+API), a Claude Code — fałszywym programem `claude`, który odpowiada w formacie `claude -p --output-format json`
+i sprawdza flagi, stdin oraz brak klucza API w środowisku. Pokrycie m.in.: guard paper URL, walidacja JSON
+decyzji (niepoprawna = HOLD), każda reguła risk managera, agent LLM (błędy CLI, limity, odmowy, ucięcia,
+triggery), harmonogram slotów, egzekucja (pełne/częściowe/brak realizacji, odrzucenia, stop-lossy, rekoncyliacja),
+metryki, `--check` i pełne przebiegi dry-run/live z raportem.
 
 ---
 
@@ -367,6 +424,10 @@ metryki i pełne przebiegi dry-run/live z raportem.
   wymaga płatnej subskrypcji Alpaca.
 - **Świece 1H** mają znaczniki pełnych godzin; świeca 9:00 obejmuje 9:00–10:00, czyli też ostatnie 30 min przed
   otwarciem. Do wskaźników bierzemy tylko zamknięte świece.
+- **Limity subskrypcji**: gdy plan się wyczerpie, wywołania kończą się błędem i agent daje HOLD — to są
+  „wymuszone” HOLD-y; filtruj je po `source = llm_error`.
+- **Wersja Claude Code** może się zmieniać przy aktualizacjach; prompt systemowy jest w całości nasz
+  (`--system-prompt`), ale zapisuj wersję z `claude --version` przy ważnych zmianach.
 - **Dzienny limit straty** jest sprawdzany na początku każdego przebiegu (co slot); między przebiegami chronią
   pozycje stop-lossy po stronie Alpaca.
 - **Limit pozycji** jest liczony konserwatywnie: miejsce po sprzedaży zwalnia się dopiero w następnym przebiegu.

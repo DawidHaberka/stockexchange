@@ -101,7 +101,7 @@ class AgentDecision:
     """Decyzja agenta wraz z metadanymi pochodzenia."""
 
     decision: Decision
-    source: str  # llm | no_trigger | invalid | api_error | refusal | rule | halted | no_data
+    source: str  # llm | no_trigger | invalid | llm_error | refusal | rule | halted | no_data
     triggers: list[str] = field(default_factory=list)
     llm_call_id: int | None = None
     validation_error: str | None = None

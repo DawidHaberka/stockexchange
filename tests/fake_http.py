@@ -1,7 +1,7 @@
-"""Atrapa serwera Alpaca na poziomie HTTP (requests.Session.request) i Claude (httpx2.MockTransport).
+"""Atrapa serwera Alpaca na poziomie HTTP (requests.Session.request).
 
-Pozwala przetestować PRAWDZIWE adaptery (alpaca-py + nasze AlpacaBroker / AlpacaMarketData,
-SDK anthropic + LLMAgent) bez sieci: payloady mają format z dokumentacji API.
+Pozwala przetestować PRAWDZIWE adaptery (alpaca-py + nasze AlpacaBroker / AlpacaMarketData)
+bez sieci: payloady mają format z dokumentacji API.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-import httpx2
 import requests
 
 from trader.broker import NY
@@ -206,39 +205,3 @@ def patch_broker(broker, fake: FakeAlpacaHTTP) -> None:
 def patch_market_data(md, fake: FakeAlpacaHTTP) -> None:
     md._stock._session.request = fake.request
     md._news._session.request = fake.request
-
-
-# --------------------------------------------------------------------------- Claude (HTTP)
-class FakeClaudeHTTP:
-    """Odpowiada jak POST /v1/messages; zapisuje ciała żądań i nagłówki."""
-
-    def __init__(self, decide):
-        self.decide = decide            # (ticker, body) -> dict decyzji lub str surowej odpowiedzi
-        self.bodies: list[dict] = []
-        self.headers: list[dict] = []
-
-    def handler(self, request: httpx2.Request) -> httpx2.Response:
-        if request.method == "GET" and request.url.path.startswith("/v1/models/"):
-            mid = request.url.path.rsplit("/", 1)[1]
-            return httpx2.Response(200, json={"type": "model", "id": mid, "display_name": mid,
-                                              "created_at": "2026-09-01T00:00:00Z"})
-        body = json.loads(request.content)
-        self.bodies.append(body)
-        self.headers.append(dict(request.headers))
-        prompt = body["messages"][0]["content"]
-        ticker = prompt.split("\n", 1)[0].replace("Ticker:", "").strip()
-        out = self.decide(ticker, body)
-        text = out if isinstance(out, str) else json.dumps(out)
-        return httpx2.Response(200, json={
-            "id": f"msg_{uuid.uuid4().hex[:12]}", "type": "message", "role": "assistant", "model": body["model"],
-            "content": [{"type": "thinking", "thinking": "", "signature": "sig"}, {"type": "text", "text": text}],
-            "stop_reason": "end_turn", "stop_sequence": None,
-            "usage": {"input_tokens": 1500, "output_tokens": 700, "cache_creation_input_tokens": 0,
-                      "cache_read_input_tokens": 900},
-        }, headers={"request-id": "req_test"})
-
-    def client(self):
-        import anthropic
-
-        return anthropic.Anthropic(api_key="test-key", base_url="https://api.anthropic.com", max_retries=0,
-                                   http_client=httpx2.Client(transport=httpx2.MockTransport(self.handler)))

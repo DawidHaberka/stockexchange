@@ -35,8 +35,8 @@ data:
   max_news_per_ticker: 5
   hourly_closes_in_context: 8
 
-# Kiedy wywołać LLM dla tickera. Bez żadnego triggera: HOLD bez wywołania API
-# (decyzja z source="no_trigger").
+# Kiedy wywołać LLM dla tickera. Bez żadnego triggera: HOLD bez wywołania modelu
+# (decyzja z source="no_trigger"). Mniej wywołań = mniejsze zużycie limitu planu Claude.
 triggers:
   on_first_evaluation: true  # ticker nigdy wcześniej nie oceniany przez LLM
   on_new_news: true          # nowy news od poprzedniego uruchomienia
@@ -44,24 +44,26 @@ triggers:
   price_reference: last_run  # last_run | last_llm_call
   near_stop_atr_mult: 1.0    # pozycja: (cena - stop) <= 1.0 x ATR(1H)
 
+# Claude wywoływany przez Claude Code CLI (`claude -p`) na subskrypcji Claude (Pro/Max)
+# — BEZ płatnego API i bez ANTHROPIC_API_KEY. Na maszynie z cronem: `claude auth login`.
 llm:
+  cli_path: claude
+  # Pełna nazwa modelu (alias typu "opus" przesuwa się przy nowych wersjach = inny wariant).
+  # Jeśli Twój plan nie obejmuje Opus w Claude Code, ustaw np. claude-sonnet-5-5.
   model: claude-opus-5-5
-  # Głębokość rozumowania: low | medium | high | xhigh | max.
-  # (temperature nie jest już obsługiwane przez API — patrz README.)
+  # Głębokość rozumowania: low | medium | high | xhigh | max (odpowiednik "temperatury" do porównań).
   effort: medium
-  max_tokens: 16000
   timeout_s: 300
-  max_retries: 2
-  # Server-side fallback przy odmowie modelu (stop_reason=refusal).
-  # Faktycznie użyty model jest zapisywany w llm_calls.model_served.
-  refusal_fallback: true
+  max_retries: 1
+  # Dodatkowe flagi CLI: bez CLAUDE.md/hooków/pluginów i bez serwerów MCP (powtarzalność wariantu).
+  cli_extra_args: ["--safe-mode", "--strict-mcp-config"]
   system_prompt: |
     You are the decision engine of a research experiment that tests whether a
     language model can make better equity trading decisions than simple
     benchmarks (buy-and-hold SPY and an SMA 20/50 crossover rule). You trade a
     small paper (simulated) account. Real money is never at risk, but treat
-    the account as if it were real: the goal is the best risk-adjusted return
-    AFTER the cost of your own API calls, not activity for its own sake.
+    the account as if it were real: the goal is the best risk-adjusted return,
+    not activity for its own sake.
 
     You are called for ONE ticker at a time, intraday, only when something
     changed (new news, a price move larger than one hourly ATR, a position
@@ -89,8 +91,7 @@ llm:
       the CURRENT position to sell (100 = close it). SELL without a position
       is meaningless.
     - HOLD: do nothing. size_pct = 0. HOLD is a perfectly good default;
-      every trade has costs (spread, slippage, API cost) and noise is not a
-      signal.
+      every trade has costs (spread, slippage) and noise is not a signal.
 
     confidence is your calibrated probability (0-1) that the action improves
     the portfolio's risk-adjusted return versus doing nothing over the next
@@ -104,16 +105,6 @@ llm:
     fields: ticker (the ticker you were asked about), action (BUY, SELL or
     HOLD), size_pct (number 0-100), confidence (number 0-1), reasoning (2-4
     sentences in Polish explaining the key facts behind the decision).
-
-# Ceny USD za 1M tokenów (do liczenia kosztu każdego wywołania).
-# cache_write = zapis do cache 5 min (1.25 x input), cache_read = odczyt z cache.
-pricing_usd_per_mtok:
-  claude-opus-5-5:   {input: 4.00,  output: 20.00, cache_write: 5.00,   cache_read: 0.20}
-  claude-sonnet-5-5: {input: 2.00,  output: 10.00, cache_write: 2.50,   cache_read: 0.20}
-  claude-haiku-5-5:  {input: 0.10,  output: 0.50,  cache_write: 0.125,  cache_read: 0.01}
-  claude-fable-5-1:  {input: 10.00, output: 50.00, cache_write: 12.50,  cache_read: 0.25}
-  claude-opus-5:     {input: 5.00,  output: 25.00, cache_write: 6.25,   cache_read: 0.50}
-  claude-sonnet-5:   {input: 2.00,  output: 10.00, cache_write: 2.50,   cache_read: 0.20}
 
 # Agent bazowy: crossover SMA na świecach 1H, ta sama częstotliwość co LLM.
 # SMA_fast > SMA_slow -> trzymaj pozycję target_size_pct; poniżej -> zamknij.

@@ -1,6 +1,8 @@
 """Raport dzienny: equity curve LLM vs SMA vs buy-and-hold SPY od tego samego startu.
 
-Wynik netto = zysk - koszty API (koszt API liczony tylko dla przebiegów live od startu).
+Agent LLM działa na subskrypcji Claude (Claude Code CLI), więc wywołania nie są płatne per token.
+Dla informacji raport pokazuje „równoważnik cen API” (wycena tokenów wg cennika API, raportowana
+przez CLI) i wynik, jaki LLM miałby przy płatnym API: zysk - równoważnik (tylko przebiegi live od startu).
 """
 
 from __future__ import annotations
@@ -133,7 +135,7 @@ def benchmark_series(db: Database, cfg: AppConfig, ref: Series) -> Series:
 
 
 # =========================================================================== metryki
-def api_costs(db: Database, since_iso: str | None) -> dict:
+def llm_cost_equiv(db: Database, since_iso: str | None) -> dict:
     q = ("SELECT r.mode AS mode, COUNT(*) AS n, COALESCE(SUM(c.cost_usd), 0) AS cost FROM llm_calls c "
          "JOIN runs r ON r.id = c.run_id {where} GROUP BY r.mode")
     where, params = ("WHERE c.created_at >= ?", (since_iso,)) if since_iso else ("", ())
@@ -168,16 +170,18 @@ def compute_metrics(cfg: AppConfig, db: Database) -> dict:
             m["n_trades"] = 0
             m["win_rate_pct"] = None
         if name == "llm":
-            costs = api_costs(db, since)
-            m["api_cost_usd"] = costs["live"]["cost_usd"]
-            m["api_calls"] = costs["live"]["calls"]
-            m["api_cost_dry_run_usd"] = costs["dry_run"]["cost_usd"]
+            costs = llm_cost_equiv(db, since)
+            m["llm_calls"] = costs["live"]["calls"]
+            m["llm_cost_equiv_usd"] = costs["live"]["cost_usd"]
+            m["llm_calls_dry_run"] = costs["dry_run"]["calls"]
+            m["llm_cost_equiv_dry_run_usd"] = costs["dry_run"]["cost_usd"]
         else:
-            m["api_cost_usd"] = 0.0
+            m["llm_cost_equiv_usd"] = 0.0
         gross = (m["end_value"] - m["start_value"]) if m["start_value"] is not None else None
         m["gross_pnl_usd"] = gross
-        m["net_pnl_usd"] = gross - m["api_cost_usd"] if gross is not None else None
-        m["net_return_pct"] = (m["net_pnl_usd"] / m["start_value"] * 100) if gross is not None and m["start_value"] else None
+        m["net_pnl_api_equiv_usd"] = gross - m["llm_cost_equiv_usd"] if gross is not None else None
+        m["net_return_api_equiv_pct"] = (m["net_pnl_api_equiv_usd"] / m["start_value"] * 100
+                                         if gross is not None and m["start_value"] else None)
         out["agents"][name] = m
     out["series"] = {n: [(ts.isoformat(), v) for ts, v in s.equity.items()] for n, s in series.items()}
     return out
@@ -202,12 +206,12 @@ def _today_stats(db: Database, session_date: str) -> list[str]:
         no_trig = sum(1 for r in rows if r["source"] == "no_trigger")
         lines.append(f"- **{AGENT_LABELS[agent]}**: decyzje {len(rows)} ({', '.join(f'{k} {v}' for k, v in by_action.items())})"
                      f"; risk: {', '.join(f'{k} {v}' for k, v in by_risk.items())}"
-                     + (f"; bez wywołania API (no trigger): {no_trig}" if agent == "llm" else ""))
+                     + (f"; bez wywołania modelu (no trigger): {no_trig}" if agent == "llm" else ""))
     c = db.query_one("""SELECT COUNT(*) AS n, COALESCE(SUM(c.cost_usd),0) AS cost,
                               COALESCE(SUM(c.input_tokens),0) AS i, COALESCE(SUM(c.output_tokens),0) AS o,
                               COALESCE(SUM(c.cache_read_tokens),0) AS cr
                        FROM llm_calls c JOIN runs r ON r.id = c.run_id WHERE r.session_date = ?""", (session_date,))
-    lines.append(f"- **API Claude dziś**: {c['n']} wywołań, koszt {c['cost']:.4f} USD "
+    lines.append(f"- **Claude (subskrypcja) dziś**: {c['n']} wywołań, równoważnik cen API {c['cost']:.4f} USD "
                  f"(in {c['i']:,} / out {c['o']:,} / cache read {c['cr']:,} tokenów)")
     o = db.query("""SELECT o.agent, o.status, COUNT(*) AS n FROM orders o JOIN runs r ON r.id = o.run_id
                     WHERE r.session_date = ? GROUP BY o.agent, o.status""", (session_date,))
@@ -240,10 +244,11 @@ def render_markdown(cfg: AppConfig, db: Database, metrics: dict, session_date: s
 
     row("Kapitał startowy (USD)", "start_value")
     row("Kapitał bieżący (USD)", "end_value")
-    row("Total return brutto", "total_return_pct", "{:+.2f}%")
-    row("Koszt API (USD)", "api_cost_usd", "{:,.4f}")
-    row("Wynik netto (USD)", "net_pnl_usd", "{:+,.2f}")
-    row("Total return netto", "net_return_pct", "{:+.2f}%")
+    row("Wynik (USD)", "gross_pnl_usd", "{:+,.2f}")
+    row("Total return", "total_return_pct", "{:+.2f}%")
+    row("Równoważnik cen API LLM (USD)", "llm_cost_equiv_usd", "{:,.4f}")
+    row("Wynik przy cenach API (USD)", "net_pnl_api_equiv_usd", "{:+,.2f}")
+    row("Return przy cenach API", "net_return_api_equiv_pct", "{:+.2f}%")
     row("Sharpe (ann.)", "sharpe", "{:.2f}")
     row("Max drawdown", "max_drawdown_pct", "{:.2f}%")
     row("Win rate", "win_rate_pct", "{:.1f}%")
@@ -251,15 +256,18 @@ def render_markdown(cfg: AppConfig, db: Database, metrics: dict, session_date: s
     row("Dni w serii", "days", "{:d}")
     if A["llm"].get("available"):
         lines.append("")
-        lines.append(f"Wywołania API (live): {A['llm'].get('api_calls', 0)}; koszt wywołań w dry-run (poza wynikiem): "
-                     f"{A['llm'].get('api_cost_dry_run_usd', 0):.4f} USD.")
+        lines.append(f"Wywołania Claude (live): {A['llm'].get('llm_calls', 0)}; w dry-run: "
+                     f"{A['llm'].get('llm_calls_dry_run', 0)} (równoważnik {A['llm'].get('llm_cost_equiv_dry_run_usd', 0):.4f} "
+                     "USD, poza wynikiem). Przy subskrypcji żadne wywołanie nie jest płatne per token.")
     lines += ["", "## Dzisiaj", *_today_stats(db, session_date), ""]
     if png_name:
         lines += [f"![Equity curve]({png_name})", ""]
     lines += [
         "## Jak czytać",
-        "- **Total return netto** dla LLM odejmuje koszt wszystkich wywołań Claude w przebiegach live — to jest "
-        "właściwa miara, czy LLM „zarabia na siebie”.",
+        "- **Total return**: zmiana equity od startu. Agent LLM działa na subskrypcji Claude (Claude Code CLI), "
+        "więc nie płaci za wywołania — porównanie LLM vs SMA vs SPY jest bez kosztów modelu.",
+        "- **Wynik przy cenach API**: ile zostałoby z zysku LLM, gdyby każde wywołanie było płatne wg cennika API "
+        "(równoważnik raportowany przez Claude Code). To odpowiedź na pytanie, czy LLM „zarabiałby na siebie”.",
         "- **Sharpe** z dziennych zmian equity (annualizowany √252, rf z config). Przy kilku–kilkunastu dniach "
         "danych jest bardzo niestabilny — nie wyciągaj wniosków przed ~3 miesiącami.",
         "- **Max drawdown**: największy spadek od szczytu equity.",

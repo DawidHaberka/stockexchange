@@ -1,4 +1,4 @@
-"""Triggery decydujące, czy dla danego tickera warto wywołać LLM (koszt API!)."""
+"""Triggery decydujące, czy dla danego tickera warto wywołać LLM (każde wywołanie zużywa limit planu)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class TickerHistory:
 
 def evaluate_triggers(snap: TickerSnapshot, hist: TickerHistory | None, position: PositionState | None,
                       stop_price: float | None, cfg: TriggerCfg) -> list[str]:
-    """Zwraca listę powodów wywołania LLM. Pusta lista = HOLD bez wywołania API."""
+    """Zwraca listę powodów wywołania LLM. Pusta lista = HOLD bez wywołania modelu."""
     triggers: list[str] = []
     price = snap.price
     atr_1h = snap.hourly.atr14

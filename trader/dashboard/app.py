@@ -64,8 +64,10 @@ if metrics.get("provisional"):
 rows = []
 for key, label, fmt in [
     ("start_value", "Kapitał startowy (USD)", "{:,.2f}"), ("end_value", "Kapitał bieżący (USD)", "{:,.2f}"),
-    ("total_return_pct", "Total return brutto", "{:+.2f}%"), ("api_cost_usd", "Koszt API (USD)", "{:,.4f}"),
-    ("net_pnl_usd", "Wynik netto (USD)", "{:+,.2f}"), ("net_return_pct", "Total return netto", "{:+.2f}%"),
+    ("gross_pnl_usd", "Wynik (USD)", "{:+,.2f}"), ("total_return_pct", "Total return", "{:+.2f}%"),
+    ("llm_cost_equiv_usd", "Równoważnik cen API LLM (USD)", "{:,.4f}"),
+    ("net_pnl_api_equiv_usd", "Wynik przy cenach API (USD)", "{:+,.2f}"),
+    ("net_return_api_equiv_pct", "Return przy cenach API", "{:+.2f}%"),
     ("sharpe", "Sharpe (ann.)", "{:.2f}"), ("max_drawdown_pct", "Max drawdown", "{:.2f}%"),
     ("win_rate_pct", "Win rate", "{:.1f}%"), ("n_trades", "Liczba transakcji", "{:d}"),
 ]:
@@ -94,14 +96,14 @@ st.subheader("Log decyzji")
 c1, c2, c3, c4 = st.columns(4)
 agent_f = c1.multiselect("Agent", ["llm", "sma"], default=["llm", "sma"])
 action_f = c2.multiselect("Akcja", ["BUY", "SELL", "HOLD"], default=["BUY", "SELL", "HOLD"])
-hide_silent = c3.checkbox("Ukryj HOLD bez wywołania API (no_trigger / reguła)", value=True)
+hide_silent = c3.checkbox("Ukryj HOLD bez wywołania modelu (no_trigger / reguła)", value=True)
 include_dry = c4.checkbox("Pokaż dry-run", value=True)
 limit = st.slider("Liczba wierszy", 50, 2000, 300, step=50)
 
 dec = df("""SELECT d.id, d.created_at, d.agent, d.ticker, d.action, d.size_pct, d.confidence, d.source,
                    d.risk_status, d.risk_reason, d.order_qty, d.limit_price, d.stop_price, d.reasoning,
                    d.triggers, d.validation_error, d.dry_run, d.model, d.effort, d.frequency, d.prompt_hash,
-                   d.config_hash, c.cost_usd
+                   d.config_hash, c.cost_usd AS cost_equiv_usd
             FROM decisions d LEFT JOIN llm_calls c ON c.id = d.llm_call_id
             ORDER BY d.id DESC LIMIT ?""", (limit * 5,))
 if not dec.empty:
@@ -124,17 +126,18 @@ if not dec.empty:
 else:
     st.write("Brak decyzji.")
 
-# ------------------------------------------------------------------ koszty API
-st.subheader("Koszty Claude API")
-costs = df("""SELECT substr(c.created_at, 1, 10) AS day, r.mode, COUNT(*) AS calls, SUM(c.cost_usd) AS cost_usd,
+# ------------------------------------------------------------------ wywołania Claude
+st.subheader("Wywołania Claude (subskrypcja, Claude Code CLI)")
+st.caption("cost_equiv_usd = równoważnik cen API raportowany przez Claude Code; przy subskrypcji nie jest pobierany.")
+costs = df("""SELECT substr(c.created_at, 1, 10) AS day, r.mode, COUNT(*) AS calls, SUM(c.cost_usd) AS cost_equiv_usd,
                      SUM(c.input_tokens) AS input_tokens, SUM(c.output_tokens) AS output_tokens,
                      SUM(c.cache_read_tokens) AS cache_read_tokens
               FROM llm_calls c JOIN runs r ON r.id = c.run_id GROUP BY day, r.mode ORDER BY day""")
 if not costs.empty:
-    st.bar_chart(costs.pivot_table(index="day", columns="mode", values="cost_usd", aggfunc="sum").fillna(0))
+    st.bar_chart(costs.pivot_table(index="day", columns="mode", values="calls", aggfunc="sum").fillna(0))
     st.dataframe(costs, width="stretch", hide_index=True)
 variants = df("""SELECT c.model_requested, c.model_served, c.effort, c.prompt_hash, COUNT(*) AS calls,
-                        ROUND(SUM(c.cost_usd), 4) AS cost_usd, ROUND(AVG(c.latency_ms)) AS avg_latency_ms,
+                        ROUND(SUM(c.cost_usd), 4) AS cost_equiv_usd, ROUND(AVG(c.latency_ms)) AS avg_latency_ms,
                         SUM(CASE WHEN c.error IS NOT NULL THEN 1 ELSE 0 END) AS errors
                  FROM llm_calls c GROUP BY 1, 2, 3, 4""")
 if not variants.empty:

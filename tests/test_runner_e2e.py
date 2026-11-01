@@ -6,21 +6,21 @@ import pytest
 
 from trader.evaluation.report import build_report, collect_eod, compute_metrics
 from trader.runner import Runner
-from tests.conftest import NOW, FakeAnthropic, FakeBroker, FakeMarketData, fake_response, ticker_from_prompt
+from tests.conftest import NOW, FakeBroker, FakeCLI, FakeMarketData, ticker_from_prompt
 
 
-def responder(kwargs):
-    t = ticker_from_prompt(kwargs)
+def responder(prompt):
+    t = ticker_from_prompt(prompt)
     action = "BUY" if t in ("AAPL", "MSFT", "NVDA") else "HOLD"
-    return fake_response({"ticker": t, "action": action, "size_pct": 5 if action == "BUY" else 0,
-                          "confidence": 0.75, "reasoning": f"Test {t}."})
+    return {"ticker": t, "action": action, "size_pct": 5 if action == "BUY" else 0,
+            "confidence": 0.75, "reasoning": f"Test {t}."}
 
 
 @pytest.fixture
 def setup(cfg, db):
     md = FakeMarketData(cfg.watchlist)
     brokers = {"llm": FakeBroker("llm"), "sma": FakeBroker("sma")}
-    client = FakeAnthropic(responder)
+    client = FakeCLI(responder)
 
     def make(now=NOW):
         return Runner(cfg, db, brokers, md, client, now_fn=lambda: now, sleep=lambda s: None)
@@ -40,7 +40,7 @@ def test_dry_run_full_pipeline(cfg, db, setup):
     assert row["frequency"] == cfg.experiment.frequency and row["prompt_hash"] == cfg.llm.prompt_hash
     assert db.query_one("SELECT COUNT(*) AS n FROM orders WHERE status='dry_run'")["n"] >= 3
     assert db.get_experiment_start("llm") is None               # start ustawia dopiero live
-    assert s.llm_cost_usd > 0
+    assert s.llm_calls == len(cfg.watchlist) and s.llm_cost_equiv_usd > 0
 
 
 def test_orders_disabled_forces_dry_run(cfg, db, setup):
@@ -108,13 +108,14 @@ def test_report_after_live_run(cfg, db, setup):
     make().run(dry_run=False)
     session_date = collect_eod(cfg, db, brokers, md, NOW + timedelta(hours=7))
     res = build_report(cfg, db, session_date)
-    assert "LLM" in res.markdown and "SPY buy&hold" in res.markdown and "Wynik netto" in res.markdown
+    assert "LLM" in res.markdown and "SPY buy&hold" in res.markdown and "Wynik przy cenach API" in res.markdown
     assert res.md_path.exists()
     m = compute_metrics(cfg, db)
-    assert m["agents"]["llm"]["api_cost_usd"] > 0
+    assert m["agents"]["llm"]["llm_cost_equiv_usd"] > 0
     assert m["agents"]["llm"]["n_trades"] == 3
-    assert m["agents"]["llm"]["net_pnl_usd"] == pytest.approx(
-        m["agents"]["llm"]["gross_pnl_usd"] - m["agents"]["llm"]["api_cost_usd"])
+    assert m["agents"]["llm"]["net_pnl_api_equiv_usd"] == pytest.approx(
+        m["agents"]["llm"]["gross_pnl_usd"] - m["agents"]["llm"]["llm_cost_equiv_usd"])
+    assert m["agents"]["sma"]["llm_cost_equiv_usd"] == 0
 
 
 def test_report_in_dry_run_is_provisional(cfg, db, setup):

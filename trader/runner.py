@@ -51,18 +51,18 @@ class RunSummary:
     agents: dict[str, AgentRunResult] = field(default_factory=dict)
     data_problems: dict[str, list[str]] = field(default_factory=dict)
     llm_calls: int = 0
-    llm_cost_usd: float = 0.0
+    llm_cost_equiv_usd: float = 0.0     # równoważnik ceny API; przy subskrypcji nie jest pobierany
 
 
 class Runner:
     def __init__(self, cfg: AppConfig, db: Database, brokers: dict[str, Broker], market_data: MarketDataSource,
-                 llm_client=None, now_fn: Callable[[], datetime] = utcnow,
+                 llm_cli=None, now_fn: Callable[[], datetime] = utcnow,
                  sleep: Callable[[float], None] = time.sleep):
         self.cfg = cfg
         self.db = db
         self.brokers = brokers
         self.md = market_data
-        self.llm_client = llm_client
+        self.llm_cli = llm_cli
         self.now_fn = now_fn
         self.sleep = sleep
 
@@ -125,15 +125,15 @@ class Runner:
                 summary.reason = "; ".join(errors)
             row = self.db.query_one("SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS c FROM llm_calls "
                                     "WHERE run_id = ?", (run_id,))
-            summary.llm_calls, summary.llm_cost_usd = int(row["n"]), float(row["c"])
+            summary.llm_calls, summary.llm_cost_equiv_usd = int(row["n"]), float(row["c"])
         return summary
 
     # ------------------------------------------------------------------ per agent
     def _make_agent(self, name: str, live: bool):
         if name == "llm":
-            if self.llm_client is None:
-                raise RuntimeError("Brak klienta Anthropic (ANTHROPIC_API_KEY)")
-            return LLMAgent(self.llm_client, self.cfg, self.db, state_key="llm" if live else "llm_dry")
+            if self.llm_cli is None:
+                raise RuntimeError("Brak Claude Code CLI dla agenta LLM")
+            return LLMAgent(self.llm_cli, self.cfg, self.db, state_key="llm" if live else "llm_dry")
         if name == "sma":
             return SMAAgent(self.cfg)
         raise ValueError(f"Nieznany agent: {name}")

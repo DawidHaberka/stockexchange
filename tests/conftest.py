@@ -9,17 +9,18 @@ import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from trader.agent.base import PortfolioView
+from trader.agent.claude_cli import CLIResult
 from trader.broker import NY, AccountState, AssetInfo, ClockState, OrderState, PositionState, SessionHours
 from trader.config import load_config
 from trader.data.market_data import NewsItem, QuoteInfo
 from trader.storage.db import Database
+from tests.fake_claude import fake_claude  # noqa: F401  (fixture z fałszywym programem `claude`)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -226,42 +227,38 @@ class FakeMarketData:
         return [n for n in self.news_items.get(symbol, []) if n.created_at >= start][:limit]
 
 
-# --------------------------------------------------------------------------- Claude
-def fake_response(payload, model="claude-opus-5-5", stop_reason="end_turn", usage=None):
-    text = payload if isinstance(payload, str) else json.dumps(payload)
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text=text)],
-        model=model, stop_reason=stop_reason, stop_details=None, _request_id="req_test",
-        usage=usage or SimpleNamespace(input_tokens=1200, output_tokens=800, cache_creation_input_tokens=0,
-                                       cache_read_input_tokens=900),
-    )
+# --------------------------------------------------------------------------- Claude (CLI)
+EQUIV_COST = 0.0213
 
 
-class FakeMessages:
-    def __init__(self, responder):
-        self.responder = responder
-        self.calls = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.responder(kwargs)
-
-
-class FakeAnthropic:
-    """responder(kwargs) -> response; może też rzucić wyjątek."""
-
-    def __init__(self, responder):
-        self.messages = FakeMessages(responder)
-        self.beta = SimpleNamespace(messages=self.messages)
-
-    @property
-    def calls(self):
-        return self.messages.calls
+def cli_ok(structured=None, text=None, model="claude-opus-5-5", stop_reason="tool_use") -> CLIResult:
+    """Wynik udanego `claude -p` (jak zwraca ClaudeCLI.ask)."""
+    if structured is not None and text is None:
+        text = json.dumps(structured)
+    return CLIResult(True, structured=structured, text=text, model_served=model, input_tokens=1200,
+                     output_tokens=800, cache_creation_tokens=0, cache_read_tokens=900,
+                     cost_equiv_usd=EQUIV_COST, duration_ms=1500, stop_reason=stop_reason, session_id="sess-test")
 
 
-def ticker_from_prompt(kwargs) -> str:
-    content = kwargs["messages"][0]["content"]
-    return content.split("\n", 1)[0].replace("Ticker:", "").strip()
+class FakeCLI:
+    """Atrapa ClaudeCLI. decide(prompt) -> dict (structured_output) | str (surowy tekst) | CLIResult."""
+
+    def __init__(self, decide):
+        self.decide = decide
+        self.calls: list[dict] = []
+
+    def ask(self, prompt, schema, model=None, effort=None, system_prompt=None):
+        self.calls.append({"prompt": prompt, "schema": schema, "model": model, "effort": effort})
+        out = self.decide(prompt)
+        if isinstance(out, CLIResult):
+            return out
+        if isinstance(out, dict):
+            return cli_ok(structured=out)
+        return cli_ok(text=out)
+
+
+def ticker_from_prompt(prompt: str) -> str:
+    return prompt.split("\n", 1)[0].replace("Ticker:", "").strip()
 
 
 @pytest.fixture
