@@ -57,6 +57,8 @@ llm:
   max_retries: 1
   # Dodatkowe flagi CLI: bez CLAUDE.md/hooków/pluginów i bez serwerów MCP (powtarzalność wariantu).
   cli_extra_args: ["--safe-mode", "--strict-mcp-config"]
+  # Równoległe wywołania `claude -p` w jednym przebiegu (każde ~200 MB RAM; e2-micro: 1).
+  max_parallel: 1
   system_prompt: |
     You are the decision engine of a research experiment that tests whether a
     language model can make better equity trading decisions than simple
@@ -139,3 +141,17 @@ storage:
 
 report:
   risk_free_rate_annual: 0.0
+
+# Backtest portfelowy (`main.py --backtest`): ten sam kod agentów, risk managera i egzekucji,
+# symulowany broker i dane „z danego momentu” (bez zaglądania w przyszłość).
+backtest:
+  start_equity: 10000
+  spread_bps: 2.0            # bid/ask = cena -/+ 1 bp
+  adjustment: all            # all (jak live) | raw
+  dir: runtime/backtests
+  cache_dir: runtime/cache
+  # Granica wiedzy modelu: LLM odtwarzamy tylko na danych PO niej (+ bufor). Brak modelu = odmowa.
+  # Zweryfikuj w dokumentacji Anthropic (models overview -> training data cutoff).
+  llm_knowledge_cutoff:
+    claude-opus-5-5: 2026-06-30
+  llm_cutoff_buffer_days: 14

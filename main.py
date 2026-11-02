@@ -7,7 +7,10 @@ Przykłady:
   python main.py --dry-run --force       # j.w., ale ignoruje harmonogram (np. poza sesją)
   python main.py --run                   # przebieg wg harmonogramu (zlecenia tylko gdy orders_enabled)
   python main.py --report                # raport: LLM vs SMA vs SPY
-  python main.py --backtest-sma          # backtest agenta SMA na historycznych świecach 1H
+  python main.py --backtest --agents sma                 # backtest portfelowy SMA vs SPY (ten sam kod co live)
+  python main.py --backtest --agents llm,sma --start 2026-07-14 --parallel 4   # replay LLM po granicy wiedzy
+  python main.py --backtest-grid --grid 10/30,20/50,50/200 --folds 4         # wrażliwość SMA + walk-forward
+  python main.py --backtest-sma          # szybki backtest SMA per ticker (backtesting.py)
   streamlit run trader/dashboard/app.py  # dashboard
 """
 
@@ -33,7 +36,9 @@ def parse_args(argv=None):
     g.add_argument("--run", action="store_true", help="przebieg wg harmonogramu (cron co 15 min)")
     g.add_argument("--check", action="store_true", help="sprawdź połączenia i konfigurację")
     g.add_argument("--report", action="store_true", help="raport dzienny LLM vs SMA vs SPY")
-    g.add_argument("--backtest-sma", action="store_true", help="backtest agenta SMA (tylko SMA!)")
+    g.add_argument("--backtest-sma", action="store_true", help="szybki backtest SMA per ticker (backtesting.py)")
+    g.add_argument("--backtest", action="store_true", help="backtest portfelowy (replay) — sma i/lub llm")
+    g.add_argument("--backtest-grid", action="store_true", help="wrażliwość parametrów SMA + walk-forward")
     p.add_argument("--dry-run", action="store_true", help="wszystko poza wysłaniem zleceń (implikuje --run)")
     p.add_argument("--force", action="store_true", help="tylko z --dry-run: ignoruj harmonogram/godziny sesji")
     p.add_argument("--agents", default="llm,sma", help="lista agentów, np. llm lub llm,sma")
@@ -41,13 +46,22 @@ def parse_args(argv=None):
     p.add_argument("--env", default=".env")
     p.add_argument("--symbols", default=None, help="backtest: lista tickerów (domyślnie watchlista)")
     p.add_argument("--days", type=int, default=365, help="backtest: liczba dni historii")
-    p.add_argument("--cash", type=float, default=10_000.0, help="backtest: kapitał startowy")
+    p.add_argument("--cash", type=float, default=10_000.0, help="backtest-sma: kapitał startowy")
+    p.add_argument("--start", default=None, help="backtest: data początkowa YYYY-MM-DD")
+    p.add_argument("--end", default=None, help="backtest: data końcowa YYYY-MM-DD (domyślnie wczoraj)")
+    p.add_argument("--name", default=None, help="backtest: nazwa (katalog wyników; ta sama nazwa = wznowienie)")
+    p.add_argument("--fresh", action="store_true", help="backtest: zacznij od nowa (usuwa zapisany stan)")
+    p.add_argument("--parallel", type=int, default=None, help="backtest LLM: równoległe wywołania claude")
+    p.add_argument("--grid", default="10/30,20/50,50/200", help="backtest-grid: pary fast/slow")
+    p.add_argument("--folds", type=int, default=4, help="backtest-grid: liczba odcinków walk-forward")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
-    if args.dry_run and not (args.run or args.check or args.report or args.backtest_sma):
+    commands = (args.run, args.check, args.report, args.backtest_sma, args.backtest, args.backtest_grid)
+    if args.dry_run and not any(commands):
         args.run = True
-    if not (args.run or args.check or args.report or args.backtest_sma):
-        p.error("podaj jedną z opcji: --run, --dry-run, --check, --report, --backtest-sma")
+    if not any((args.run, *commands[1:])):
+        p.error("podaj jedną z opcji: --run, --dry-run, --check, --report, --backtest, --backtest-grid, "
+                "--backtest-sma")
     if args.dry_run and not args.run:
         p.error("--dry-run dotyczy tylko przebiegu (--run)")
     if args.force and not args.dry_run:
@@ -241,7 +255,7 @@ def cmd_report(cfg, secrets, args) -> int:
     return 0
 
 
-def cmd_backtest(cfg, secrets, args) -> int:
+def cmd_backtest_sma(cfg, secrets, args) -> int:
     import pandas as pd
 
     from trader.evaluation.backtest_sma import backtest_watchlist, results_table
@@ -252,6 +266,83 @@ def cmd_backtest(cfg, secrets, args) -> int:
     with pd.option_context("display.width", 160, "display.max_columns", 20):
         print(results_table(results).round(2).to_string(index=False))
     print("\nUwaga: backtest dotyczy wyłącznie agenta SMA. Agent LLM nie jest backtestowany (look-ahead bias).")
+    return 0
+
+
+def _backtest_window(cfg, args, llm: bool):
+    from datetime import date, timedelta
+
+    from trader.broker import NY
+    from trader.storage.db import utcnow
+
+    end = date.fromisoformat(args.end) if args.end else utcnow().astimezone(NY).date() - timedelta(days=1)
+    if args.start:
+        start = date.fromisoformat(args.start)
+    elif llm:
+        start = cfg.backtest.llm_not_before(cfg.llm.model) or end
+    else:
+        start = end - timedelta(days=365)
+    return start, end
+
+
+def _load_store(cfg, secrets, start, end, with_news, slow):
+    import math
+
+    from trader.backtest.history import load_history
+    from trader.data.market_data import AlpacaMarketData
+
+    creds = secrets.accounts.get("llm") or next(iter(secrets.accounts.values()), None)
+    if creds is None:
+        raise ConfigError("Brak kluczy Alpaca w .env (potrzebne do pobrania historii)")
+    md = AlpacaMarketData(creds, cfg.data.feed, cfg.backtest.adjustment)
+    symbols = list(dict.fromkeys([*cfg.watchlist, cfg.benchmark_symbol]))
+    # SMA na 1H potrzebuje `slow` zamkniętych świec (~6,5 na sesję) + zapas na weekendy/święta
+    hourly_days = max(cfg.data.hourly_lookback_days, math.ceil(slow / 6.5 * 1.6) + 7)
+    return load_history(md, symbols, start, end, hourly_days, cfg.data.daily_lookback_days, with_news,
+                        cfg.data.news_lookback_hours, cfg.backtest.cache_dir, cfg.data.feed, cfg.backtest.adjustment)
+
+
+def cmd_backtest(cfg, secrets, args) -> int:
+    from trader.backtest.engine import BacktestEngine, BacktestPaused, BacktestSpec, LookAheadForbidden, check_llm_window
+    from trader.backtest.report import write_report
+
+    agents = [a.strip() for a in args.agents.split(",") if a.strip()]
+    llm = "llm" in agents
+    start, end = _backtest_window(cfg, args, llm)
+    if llm:
+        try:
+            check_llm_window(cfg, start)
+        except LookAheadForbidden as exc:
+            print(f"STOP: {exc}", file=sys.stderr)
+            return 2
+        if args.parallel:
+            cfg.llm.max_parallel = args.parallel
+    name = args.name or f"{'-'.join(agents)}_{start}_{end}"
+    store = _load_store(cfg, secrets, start, end, llm, cfg.sma.slow)
+    spec = BacktestSpec(name, start, end, agents, fresh=args.fresh)
+    engine = BacktestEngine(cfg, store, spec, build_llm_cli(cfg) if llm else None)
+    try:
+        res = engine.run()
+    except BacktestPaused as exc:
+        print(f"\nPAUZA: {exc}")
+        return 3
+    path = write_report(res, res.extra["db"])
+    print(path.read_text(encoding="utf-8"))
+    print(f"Wyniki: {res.out_dir} (czas {res.elapsed_s:.0f} s)")
+    return 0
+
+
+def cmd_backtest_grid(cfg, secrets, args) -> int:
+    from pathlib import Path
+
+    from trader.backtest.grid import parse_pairs, run_grid, write_grid_report
+
+    start, end = _backtest_window(cfg, args, llm=False)
+    pairs = parse_pairs(args.grid)
+    store = _load_store(cfg, secrets, start, end, False, max(s for _, s in pairs))
+    res = run_grid(cfg, store, start, end, pairs, args.folds)
+    path = write_grid_report(res, Path(cfg.backtest.dir) / (args.name or f"grid_{start}_{end}"), start, end)
+    print(path.read_text(encoding="utf-8"))
     return 0
 
 
@@ -267,7 +358,11 @@ def main(argv=None) -> int:
         if args.report:
             return cmd_report(cfg, secrets, args)
         if args.backtest_sma:
+            return cmd_backtest_sma(cfg, secrets, args)
+        if args.backtest:
             return cmd_backtest(cfg, secrets, args)
+        if args.backtest_grid:
+            return cmd_backtest_grid(cfg, secrets, args)
         return cmd_run(cfg, secrets, args)
     except LiveTradingForbidden as exc:
         logging.getLogger("main").critical(str(exc))

@@ -27,7 +27,7 @@ dodatkowo „równoważnik cen API”, czyli ile kosztowałyby te same wywołani
 8. [Risk manager](#risk-manager)
 9. [Raport — jak go czytać](#raport--jak-go-czytać)
 10. [Dashboard](#dashboard)
-11. [Backtest (tylko SMA)](#backtest-tylko-sma)
+11. [Backtesty](#backtesty)
 12. [Testy](#testy)
 13. [Ograniczenia metodologiczne](#ograniczenia-metodologiczne)
 
@@ -304,6 +304,8 @@ po wariancie.
 | `llm.cli_path` | ścieżka do programu `claude` |
 | `llm.cli_extra_args` | dodatkowe flagi CLI (domyślnie `--safe-mode --strict-mcp-config`) |
 | `llm.timeout_s`, `llm.max_retries` | limit czasu wywołania; ponowienia przy 429/5xx/timeout |
+| `llm.max_parallel` | równoległe wywołania `claude -p` w jednym przebiegu (e2-micro: 1) |
+| `backtest.*` | kapitał, spread, korekta świec, katalogi, **granica wiedzy modeli** dla replayu LLM |
 | `triggers.*` | progi wywołania LLM |
 | `risk.*` | limity risk managera |
 | `execution.*` | bezpiecznik `orders_enabled`, offset ceny limit, timeout realizacji |
@@ -362,10 +364,12 @@ obejmuje tylko faktycznie posiadaną ilość. Odrzucenia brokera są zapisywane 
 | Max drawdown | największy spadek od szczytu equity |
 | Win rate | % zamkniętych sprzedaży (parowanie FIFO) z dodatnim wynikiem |
 | Liczba transakcji | liczba realizacji (w tym stop-lossów) |
+| **Istotność statystyczna** | test różnicy dziennych stóp zwrotu LLM vs SPY / LLM vs SMA / SMA vs SPY: roczna nadwyżka, 95% CI (bootstrap blokowy), t, p, information ratio i ile dni trzeba do t = 2 |
 
 Wskazówki interpretacyjne:
-- **Kilka dni to szum.** Sharpe i win rate z < ~60 sesji są bardzo niestabilne; porównuj z SPY dopiero po
-  kilku miesiącach i patrz na drawdown, nie tylko zwrot.
+- **Kilka dni to szum.** Do odróżnienia przewagi od przypadku (t ≈ 2) potrzeba ok. 4 / ΔSR² lat danych
+  (ΔSR = różnica rocznego Sharpe'a): przy ΔSR = 1 to ~4 lata, przy ΔSR = 2 ~1 rok. Sekcja „Istotność
+  statystyczna” mówi wprost, czy różnica jest już istotna i ile dni jeszcze potrzeba.
 - LLM, który bije SMA, ale przegrywa z SPY, nie dodaje wartości ponad pasywny indeks.
 - Duży „równoważnik cen API” przy małej liczbie transakcji → model jest pytany za często; zaostrz triggery
   albo obniż `effort` (to też oszczędza limity planu).
@@ -390,16 +394,60 @@ i wg wariantu, zlecenia, transakcje i wersje konfiguracji.
 
 ---
 
-## Backtest (tylko SMA)
+## Backtesty
+
+Wszystkie backtesty potrzebują historii z Alpaca (klucze w `.env`); pobrana historia trafia do cache
+(`runtime/cache`), a wyniki do `runtime/backtests/<nazwa>/` (`report.md`, `equity.png`, `equity.csv`,
+`trades.csv`, `decisions.csv`, baza `backtest.db`).
+
+### 1. Backtest portfelowy (replay) — ten sam kod co na żywo
+
+```bash
+.venv/bin/python main.py --backtest --agents sma --start 2025-11-03 --end 2026-10-30
+```
+
+Sesja po sesji i slot po slocie (10:00, 11:00, … jak na żywo) uruchamiany jest prawdziwy `Runner`: triggery,
+agenci, risk manager (limity, cooldown, dzienny limit straty), egzekucja i stop-lossy — tylko broker jest
+symulowany, a dane są **„z danego momentu”**: w każdym slocie agent widzi wyłącznie zamknięte świece 1H,
+świece 1D z poprzednich sesji i newsy opublikowane do tej chwili. Realizacja: po cenie ask/bid z chwili decyzji
+(`backtest.spread_bps`), stop-lossy na kolejnych świecach 1H (przy luce — po cenie otwarcia).
+
+### 2. Replay agenta LLM — tylko po granicy wiedzy modelu
+
+```bash
+.venv/bin/python main.py --backtest --agents llm,sma --parallel 4
+```
+
+Backtest LLM na danych sprzed cutoffu modelu dawałby look-ahead bias, więc program **odmawia** replayu dla dat
+wcześniejszych niż `backtest.llm_knowledge_cutoff[model] + llm_cutoff_buffer_days` (dla `claude-opus-5-5`:
+czerwiec 2026 + 14 dni → od 2026-07-14; bez wpisu dla modelu — odmowa). Domyślny start = ta data.
+
+- decyzje co godzinę, jak w wariancie na żywo; `--parallel N` = N równoległych `claude -p` (każde ~200 MB RAM),
+- **przerwanie i wznowienie**: błąd Claude (limit planu, timeout) nie zamienia się w HOLD — slot jest cofany
+  (baza + brokerzy), backtest kończy się kodem 3, a **ta sama komenda** wznawia od tego slotu. Ctrl-C też cofa
+  bieżący slot i pozwala wznowić; po twardym zabiciu procesu w trakcie slotu program każe zacząć od nowa (`--fresh`),
+- `--fresh` zaczyna od nowa, `--name` nadaje nazwę (inna nazwa = osobny backtest).
+
+Orientacyjnie: ~75 sesji × 6 slotów, ok. 1,5–3 tys. wywołań (zależnie od newsów) — przy `--parallel 4`
+kilka godzin; zużywa limity subskrypcji.
+
+### 3. Wrażliwość parametrów SMA i walk-forward
+
+```bash
+.venv/bin/python main.py --backtest-grid --grid 10/30,20/50,50/200 --folds 4
+```
+
+Każda para na pełnym okresie, wyniki per odcinek, a walk-forward wybiera parę na podstawie **poprzedniego**
+odcinka i gra nią na następnym — porównanie ze stałym 20/50 i SPY. Duża zależność od pary = dopasowanie do
+przeszłości, nie przewaga.
+
+### Szybki backtest SMA per ticker
 
 ```bash
 .venv/bin/python main.py --backtest-sma --days 365
 ```
 
-backtesting.py na historycznych świecach 1H, z tymi samymi parametrami co agent live (SMA 20/50, 10% equity,
-stop 2×ATR, koszt ~ offset limitu). **Agent LLM nie jest backtestowany**: dane sprzed cutoffu wiedzy modelu
-dawałyby look-ahead bias (model „pamięta”, co działo się potem). LLM oceniamy wyłącznie forward, na paper tradingu.
-Uwaga: backtesting.py testuje jeden instrument naraz, więc limit 5 pozycji i wspólna gotówka nie są modelowane.
+backtesting.py, jeden instrument naraz (bez wspólnej gotówki i limitu pozycji) — do szybkiego podglądu.
 
 ---
 
@@ -414,7 +462,9 @@ API), a Claude Code — fałszywym programem `claude`, który odpowiada w formac
 i sprawdza flagi, stdin oraz brak klucza API w środowisku. Pokrycie m.in.: guard paper URL, walidacja JSON
 decyzji (niepoprawna = HOLD), każda reguła risk managera, agent LLM (błędy CLI, limity, odmowy, ucięcia,
 triggery), harmonogram slotów, egzekucja (pełne/częściowe/brak realizacji, odrzucenia, stop-lossy, rekoncyliacja),
-metryki, `--check` i pełne przebiegi dry-run/live z raportem.
+metryki, `--check`, pełne przebiegi dry-run/live z raportem oraz backtesty: brak zaglądania w przyszłość,
+symulowany broker, deterministyczne wznawianie, pauza replayu LLM na limicie i odmowa replayu przed granicą
+wiedzy modelu.
 
 ---
 

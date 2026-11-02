@@ -34,6 +34,9 @@ def parse_iso(s: str | None) -> datetime | None:
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
+        # źródło czasu dla znaczników w bazie; orkiestrator podmienia je na swój zegar
+        # (w backteście = czas symulowany), żeby wszystkie tabele miały spójny czas
+        self.clock = utcnow
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -85,7 +88,7 @@ class Database:
             """INSERT OR IGNORE INTO config_versions
                (config_hash, created_at, model, effort, frequency, prompt_hash, system_prompt, config_json)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (h, iso(utcnow()), cfg.llm.model, cfg.llm.effort, cfg.experiment.frequency,
+            (h, iso(self.clock()), cfg.llm.model, cfg.llm.effort, cfg.experiment.frequency,
              cfg.llm.prompt_hash, cfg.llm.system_prompt, cfg.canonical_json()),
         )
         return h
@@ -93,12 +96,12 @@ class Database:
     # ------------------------------------------------------------------ runs
     def start_run(self, session_date: str, slot_start: datetime | None, mode: str, config_hash: str) -> int:
         return self._insert("runs", {
-            "started_at": iso(utcnow()), "session_date": session_date, "slot_start": iso(slot_start),
+            "started_at": iso(self.clock()), "session_date": session_date, "slot_start": iso(slot_start),
             "mode": mode, "status": "running", "config_hash": config_hash,
         })
 
     def finish_run(self, run_id: int, status: str, message: str | None = None) -> None:
-        self._update("runs", run_id, {"finished_at": iso(utcnow()), "status": status, "message": message})
+        self._update("runs", run_id, {"finished_at": iso(self.clock()), "status": status, "message": message})
 
     def slot_processed(self, slot_start: datetime, mode: str) -> bool:
         row = self.query_one("SELECT 1 FROM runs WHERE slot_start = ? AND mode = ? LIMIT 1", (iso(slot_start), mode))
@@ -166,7 +169,7 @@ class Database:
             ensure_ascii=False,
         )
         return self._insert("portfolio_snapshots", {
-            "agent": agent, "run_id": run_id, "taken_at": iso(utcnow()), "session_date": session_date,
+            "agent": agent, "run_id": run_id, "taken_at": iso(self.clock()), "session_date": session_date,
             "kind": kind, "equity": account.equity, "last_equity": account.last_equity, "cash": account.cash,
             "positions_value": sum(p.market_value for p in positions.values()), "positions_json": pos_json,
         })
@@ -182,7 +185,7 @@ class Database:
             """INSERT INTO risk_state (agent, session_date, halted, reason, updated_at) VALUES (?, ?, 1, ?, ?)
                ON CONFLICT(agent, session_date) DO UPDATE SET halted = 1, reason = excluded.reason,
                updated_at = excluded.updated_at""",
-            (agent, session_date, reason, iso(utcnow())),
+            (agent, session_date, reason, iso(self.clock())),
         )
 
     # ------------------------------------------------------------------ ticker state
@@ -213,7 +216,7 @@ class Database:
             """INSERT INTO stop_levels (agent, symbol, stop_price, atr_used, updated_at) VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(agent, symbol) DO UPDATE SET stop_price = excluded.stop_price,
                atr_used = excluded.atr_used, updated_at = excluded.updated_at""",
-            (agent, symbol, stop_price, atr_used, iso(utcnow())),
+            (agent, symbol, stop_price, atr_used, iso(self.clock())),
         )
 
     def delete_stop_level(self, agent: str, symbol: str) -> None:
@@ -232,7 +235,7 @@ class Database:
             """INSERT INTO daily_reports (session_date, created_at, metrics_json, report_path) VALUES (?, ?, ?, ?)
                ON CONFLICT(session_date) DO UPDATE SET created_at = excluded.created_at,
                metrics_json = excluded.metrics_json, report_path = excluded.report_path""",
-            (session_date, iso(utcnow()), json.dumps(metrics, ensure_ascii=False, default=str), path),
+            (session_date, iso(self.clock()), json.dumps(metrics, ensure_ascii=False, default=str), path),
         )
 
     def get_meta(self, key: str) -> str | None:

@@ -57,12 +57,14 @@ class RunSummary:
 class Runner:
     def __init__(self, cfg: AppConfig, db: Database, brokers: dict[str, Broker], market_data: MarketDataSource,
                  llm_cli=None, now_fn: Callable[[], datetime] = utcnow,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, llm_fail_on_error: bool = False):
         self.cfg = cfg
         self.db = db
         self.brokers = brokers
         self.md = market_data
         self.llm_cli = llm_cli
+        self.llm_fail_on_error = llm_fail_on_error
+        self.db.clock = now_fn          # jeden zegar dla całej bazy (live: czas rzeczywisty, backtest: symulowany)
         self.now_fn = now_fn
         self.sleep = sleep
 
@@ -133,7 +135,8 @@ class Runner:
         if name == "llm":
             if self.llm_cli is None:
                 raise RuntimeError("Brak Claude Code CLI dla agenta LLM")
-            return LLMAgent(self.llm_cli, self.cfg, self.db, state_key="llm" if live else "llm_dry")
+            return LLMAgent(self.llm_cli, self.cfg, self.db, state_key="llm" if live else "llm_dry",
+                            fail_on_error=self.llm_fail_on_error)
         if name == "sma":
             return SMAAgent(self.cfg)
         raise ValueError(f"Nieznany agent: {name}")
@@ -151,8 +154,7 @@ class Runner:
 
         if live and self.db.get_experiment_start(name) is None:
             spy = snapshot.get(self.cfg.benchmark_symbol)
-            # znacznik czasu z zegara bazy (spójny z taken_at/created_at innych tabel)
-            self.db.set_experiment_start(name, utcnow(), session_date, account.equity, account.account_number,
+            self.db.set_experiment_start(name, ctx.now, session_date, account.equity, account.account_number,
                                          self.cfg.benchmark_symbol, spy.price if spy else None)
             log.info("[%s] START EKSPERYMENTU: kapitał startowy %.2f USD (z konta), %s @ %s", name,
                      account.equity, self.cfg.benchmark_symbol, spy.price if spy else "n/a")
@@ -208,7 +210,7 @@ class Runner:
             model, effort, prompt_hash = variant["model"], variant["effort"], variant["prompt_hash"]
         it = v.intent
         did = self.db.insert_decision({
-            "run_id": ctx.run_id, "agent": agent, "ticker": d.ticker, "created_at": iso(utcnow()),
+            "run_id": ctx.run_id, "agent": agent, "ticker": d.ticker, "created_at": iso(ctx.now),
             "action": d.action.value, "size_pct": d.size_pct, "confidence": d.confidence, "reasoning": d.reasoning,
             "source": ad.source, "triggers": ad.triggers, "llm_call_id": ad.llm_call_id,
             "validation_error": ad.validation_error, "risk_status": v.status, "risk_reason": v.reason,

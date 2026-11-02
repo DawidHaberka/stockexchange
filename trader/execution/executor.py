@@ -21,7 +21,7 @@ from ..broker import Broker, OrderRequest, OrderState
 from ..config import AppConfig
 from ..data.snapshot import MarketSnapshot
 from ..risk.manager import RiskVerdict, round_price
-from ..storage.db import Database, iso, utcnow
+from ..storage.db import Database, iso
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +62,8 @@ class Executor:
             "qty": req.qty, "limit_price": req.limit_price, "stop_price": req.stop_price,
             "status": status, "filled_qty": state.filled_qty if state else 0,
             "filled_avg_price": state.filled_avg_price if state else None,
-            "submitted_at": iso(state.submitted_at) if state and state.submitted_at else iso(utcnow()),
-            "updated_at": iso(utcnow()), "note": note, "dry_run": 1 if self.dry_run else 0,
+            "submitted_at": iso(state.submitted_at) if state and state.submitted_at else iso(self.db.clock()),
+            "updated_at": iso(self.db.clock()), "note": note, "dry_run": 1 if self.dry_run else 0,
             "fill_recorded": 0 if (state and not state.is_terminal) else 1,
         })
 
@@ -71,13 +71,13 @@ class Executor:
         """Aktualizuje zlecenie w bazie i — gdy terminalne — zapisuje transakcję (realizację)."""
         self.db.update_order(order_db_id, {
             "status": state.status, "filled_qty": state.filled_qty, "filled_avg_price": state.filled_avg_price,
-            "updated_at": iso(utcnow()), "fill_recorded": 1 if state.is_terminal else 0,
+            "updated_at": iso(self.db.clock()), "fill_recorded": 1 if state.is_terminal else 0,
         })
         if state.is_terminal and state.filled_qty > 0 and state.filled_avg_price:
             self.db.insert_trade({
                 "agent": self.agent, "order_id": order_db_id, "alpaca_order_id": state.id,
                 "symbol": state.symbol, "side": state.side, "qty": state.filled_qty,
-                "price": state.filled_avg_price, "filled_at": iso(state.filled_at or utcnow()), "purpose": purpose,
+                "price": state.filled_avg_price, "filled_at": iso(state.filled_at or self.db.clock()), "purpose": purpose,
             })
 
     def _wait_for_terminal(self, order: OrderState, timeout_s: float) -> OrderState:
@@ -113,12 +113,12 @@ class Executor:
             if row is not None:
                 self.db.update_order(row["id"], {"status": final.status, "filled_qty": final.filled_qty,
                                                  "filled_avg_price": final.filled_avg_price,
-                                                 "updated_at": iso(utcnow()), "fill_recorded": 1})
+                                                 "updated_at": iso(self.db.clock()), "fill_recorded": 1})
                 if final.filled_qty > 0 and final.filled_avg_price:
                     self.db.insert_trade({
                         "agent": self.agent, "order_id": row["id"], "alpaca_order_id": final.id,
                         "symbol": symbol, "side": "sell", "qty": final.filled_qty, "price": final.filled_avg_price,
-                        "filled_at": iso(final.filled_at or utcnow()), "purpose": "stop_loss",
+                        "filled_at": iso(final.filled_at or self.db.clock()), "purpose": "stop_loss",
                     })
 
     def place_stop(self, run_id, symbol: str, qty: int, stop_price: float, atr: float | None) -> bool:

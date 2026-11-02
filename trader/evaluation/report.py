@@ -19,6 +19,7 @@ from ..broker import NY, Broker
 from ..config import AppConfig
 from ..data.market_data import MarketDataSource
 from ..storage.db import Database, parse_iso
+from . import stats
 from .metrics import fifo_closed_trades, summarize, win_rate_pct
 
 log = logging.getLogger(__name__)
@@ -184,7 +185,17 @@ def compute_metrics(cfg: AppConfig, db: Database) -> dict:
                                          if gross is not None and m["start_value"] else None)
         out["agents"][name] = m
     out["series"] = {n: [(ts.isoformat(), v) for ts, v in s.equity.items()] for n, s in series.items()}
+    out["significance"] = significance(series["llm"].equity, series["sma"].equity, series["spy"].equity)
     return out
+
+
+def significance(llm: pd.Series, sma: pd.Series, spy: pd.Series) -> dict:
+    """Testy różnic dziennych stóp zwrotu (patrz evaluation/stats.py)."""
+    return {
+        "LLM vs SPY": stats.compare(llm, spy),
+        "LLM vs SMA": stats.compare(llm, sma),
+        "SMA vs SPY": stats.compare(sma, spy),
+    }
 
 
 # =========================================================================== render
@@ -259,6 +270,10 @@ def render_markdown(cfg: AppConfig, db: Database, metrics: dict, session_date: s
         lines.append(f"Wywołania Claude (live): {A['llm'].get('llm_calls', 0)}; w dry-run: "
                      f"{A['llm'].get('llm_calls_dry_run', 0)} (równoważnik {A['llm'].get('llm_cost_equiv_dry_run_usd', 0):.4f} "
                      "USD, poza wynikiem). Przy subskrypcji żadne wywołanie nie jest płatne per token.")
+    lines += ["", "## Istotność statystyczna", "",
+              *stats.format_table(list(metrics.get("significance", {}).items())), "",
+              "Test różnicy dziennych stóp zwrotu (t oraz bootstrap blokowy). „Nieistotna” = wynik nie do odróżnienia "
+              "od przypadku; nie wyciągaj wniosków, dopóki p nie spadnie wyraźnie poniżej 0,05."]
     lines += ["", "## Dzisiaj", *_today_stats(db, session_date), ""]
     if png_name:
         lines += [f"![Equity curve]({png_name})", ""]

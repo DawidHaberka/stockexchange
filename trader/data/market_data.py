@@ -85,13 +85,14 @@ def drop_today_daily(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
 
 
 class AlpacaMarketData:
-    def __init__(self, creds: AlpacaCredentials, feed: str = "iex"):
+    def __init__(self, creds: AlpacaCredentials, feed: str = "iex", adjustment: str = "all"):
         from alpaca.data.historical.news import NewsClient
         from alpaca.data.historical.stock import StockHistoricalDataClient
 
         self._stock = StockHistoricalDataClient(api_key=creds.api_key, secret_key=creds.secret_key)
         self._news = NewsClient(api_key=creds.api_key, secret_key=creds.secret_key)
         self.feed = feed
+        self.adjustment = adjustment
 
     def _feed(self):
         from alpaca.data.enums import DataFeed
@@ -104,7 +105,7 @@ class AlpacaMarketData:
 
         req = StockBarsRequest(
             symbol_or_symbols=symbols, timeframe=timeframe, start=start, end=end,
-            feed=self._feed(), adjustment=Adjustment.ALL,
+            feed=self._feed(), adjustment=Adjustment.RAW if self.adjustment == "raw" else Adjustment.ALL,
         )
         return split_bars(self._stock.get_stock_bars(req).df, symbols)
 
@@ -141,12 +142,21 @@ class AlpacaMarketData:
             return []
         res = self._news.get_news(NewsRequest(symbols=symbol, start=start, limit=limit, sort="desc",
                                               include_content=False))
-        items = []
-        for n in res.data.get("news", [])[:limit]:
-            items.append(NewsItem(
-                id=str(n.id), headline=n.headline or "", source=n.source or "",
-                created_at=n.created_at, summary=(n.summary or "")[:300], url=n.url,
-                symbols=list(n.symbols or []),
-            ))
-        return items
+        return [_news_item(n) for n in res.data.get("news", [])[:limit]]
+
+    def news_range(self, symbol: str, start: datetime, end: datetime) -> list[NewsItem]:
+        """Wszystkie newsy tickera w przedziale (stronicowanie automatyczne) — do backtestów."""
+        from alpaca.data.requests import NewsRequest
+
+        res = self._news.get_news(NewsRequest(symbols=symbol, start=start, end=end, sort="asc",
+                                              include_content=False))
+        return [_news_item(n) for n in res.data.get("news", [])]
+
+
+def _news_item(n) -> NewsItem:
+    return NewsItem(
+        id=str(n.id), headline=n.headline or "", source=n.source or "",
+        created_at=n.created_at, summary=(n.summary or "")[:300], url=n.url,
+        symbols=list(n.symbols or []),
+    )
 

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from ..config import AppConfig
 from ..data.snapshot import MarketSnapshot
-from ..storage.db import Database, iso, parse_iso, utcnow
+from ..storage.db import Database, iso, parse_iso
 from .base import PortfolioView, RunContext
 from .claude_cli import CLIResult
 from .context import build_ticker_context, cooldown_until
@@ -23,45 +24,65 @@ from .triggers import TickerHistory, evaluate_triggers
 log = logging.getLogger(__name__)
 
 
+class LLMUnavailable(RuntimeError):
+    """Wywołanie Claude się nie powiodło (limit, błąd, timeout) w trybie ścisłym (backtest)."""
+
+
 class LLMAgent:
     name = "llm"
 
-    def __init__(self, cli, cfg: AppConfig, db: Database, state_key: str = "llm"):
+    def __init__(self, cli, cfg: AppConfig, db: Database, state_key: str = "llm", fail_on_error: bool = False):
         self.cli = cli            # ClaudeCLI (lub atrapa w testach) z metodą ask(prompt, schema)
         self.cfg = cfg
         self.db = db
         # osobny stan triggerów dla dry-run i live, żeby dry-run nie „zużył” first_evaluation
         self.state_key = state_key
+        # backtest: błąd wywołania przerywa przebieg (żeby nie wstawiać wymuszonych HOLD-ów do wyników)
+        self.fail_on_error = fail_on_error
 
     # ------------------------------------------------------------------ public
     def decide(self, snapshot: MarketSnapshot, portfolio: PortfolioView, ctx: RunContext) -> list[AgentDecision]:
-        results: list[AgentDecision] = []
-        for sym in self.cfg.watchlist:
+        results: list[AgentDecision | None] = [None] * len(self.cfg.watchlist)
+        pending: list[tuple[int, str, str, list[str]]] = []     # (indeks, ticker, prompt, triggery)
+        prices: dict[str, float] = {}
+        for i, sym in enumerate(self.cfg.watchlist):
             snap = snapshot.get(sym)
             if snap is None or not snap.data_ok:
                 problems = "; ".join(snap.problems) if snap else "brak danych"
-                results.append(AgentDecision(hold(sym, f"HOLD: niekompletne dane ({problems})"), "no_data"))
+                results[i] = AgentDecision(hold(sym, f"HOLD: niekompletne dane ({problems})"), "no_data")
                 continue
-
+            prices[sym] = snap.price
             hist = self._history(sym)
             pos = portfolio.position(sym)
             triggers = evaluate_triggers(snap, hist, pos, portfolio.stop_levels.get(sym), self.cfg.triggers)
-            llm_called = False
             if not triggers:
                 log.info("[llm] %s: no trigger -> HOLD bez wywołania modelu", sym)
-                results.append(AgentDecision(hold(sym, "no trigger"), "no_trigger"))
-            else:
-                cd = cooldown_until(portfolio.last_trade_at.get(sym), self.cfg.risk.cooldown_minutes)
-                prompt = build_ticker_context(
-                    snap, portfolio, ctx, self.cfg, triggers,
-                    news_since=hist.last_run_at if hist else None, cooldown_until=cd,
-                )
-                result = self._ask(sym, prompt, triggers, ctx)
-                results.append(result)
+                results[i] = AgentDecision(hold(sym, "no trigger"), "no_trigger")
+                continue
+            cd = cooldown_until(portfolio.last_trade_at.get(sym), self.cfg.risk.cooldown_minutes)
+            prompt = build_ticker_context(snap, portfolio, ctx, self.cfg, triggers,
+                                          news_since=hist.last_run_at if hist else None, cooldown_until=cd)
+            pending.append((i, sym, prompt, triggers))
+
+        # wywołania modelu (równolegle, jeśli llm.max_parallel > 1); zapis do bazy w wątku głównym
+        workers = min(self.cfg.llm.max_parallel, len(pending))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                answers = list(pool.map(lambda p: self.cli.ask(p[2], DECISION_JSON_SCHEMA), pending))
+        else:
+            answers = [self.cli.ask(p[2], DECISION_JSON_SCHEMA) for p in pending]
+        for (i, sym, prompt, triggers), res in zip(pending, answers, strict=True):
+            results[i] = self._record(sym, prompt, triggers, ctx, res)
+
+        failed = [r for r in results if r is not None and r.source == "llm_error"]
+        if failed and self.fail_on_error:
+            raise LLMUnavailable(f"{len(failed)} wywołań Claude nieudanych, np. {failed[0].validation_error}")
+        for r in results:
+            if r is not None and r.ticker in prices:
                 # błąd wywołania nie liczy się jako ocena — ticker zostanie oceniony ponownie
-                llm_called = result.source != "llm_error"
-            self.db.update_ticker_state(self.state_key, sym, ctx.now, snap.price, llm_called)
-        return results
+                called = r.source not in ("no_trigger", "llm_error")
+                self.db.update_ticker_state(self.state_key, r.ticker, ctx.now, prices[r.ticker], called)
+        return [r for r in results if r is not None]
 
     # ------------------------------------------------------------------ internals
     def _history(self, sym: str) -> TickerHistory | None:
@@ -73,12 +94,11 @@ class LLMAgent:
             last_llm_at=parse_iso(row["last_llm_at"]), last_llm_price=row["last_llm_price"],
         )
 
-    def _ask(self, sym: str, prompt: str, triggers: list[str], ctx: RunContext) -> AgentDecision:
+    def _record(self, sym: str, prompt: str, triggers: list[str], ctx: RunContext, res: CLIResult) -> AgentDecision:
         llm = self.cfg.llm
-        res: CLIResult = self.cli.ask(prompt, DECISION_JSON_SCHEMA)
         raw = json.dumps(res.structured, ensure_ascii=False) if res.structured is not None else res.text
         call_id = self.db.insert_llm_call({
-            "run_id": ctx.run_id, "ticker": sym, "created_at": iso(utcnow()),
+            "run_id": ctx.run_id, "ticker": sym, "created_at": iso(ctx.now),
             "model_requested": llm.model, "model_served": res.model_served, "effort": llm.effort,
             "prompt_hash": llm.prompt_hash, "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
             "cache_creation_tokens": res.cache_creation_tokens, "cache_read_tokens": res.cache_read_tokens,

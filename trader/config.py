@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -64,6 +65,8 @@ class LLMCfg(_Strict):
     timeout_s: float = Field(300, gt=0)
     max_retries: int = Field(1, ge=0)
     cli_extra_args: list[str] = ["--safe-mode", "--strict-mcp-config"]
+    # ile wywołań `claude -p` równolegle w jednym przebiegu (e2-micro: 1-2; mocniejsza maszyna: 4+)
+    max_parallel: int = Field(1, ge=1, le=16)
     system_prompt: str
 
     @field_validator("system_prompt")
@@ -117,6 +120,24 @@ class ReportCfg(_Strict):
     risk_free_rate_annual: float = 0.0
 
 
+class BacktestCfg(_Strict):
+    """Backtest portfelowy (replay) na danych historycznych z danego momentu."""
+
+    start_equity: float = Field(10_000.0, gt=0)
+    spread_bps: float = Field(2.0, ge=0)          # symulowany spread: bid/ask = cena -/+ połowa
+    adjustment: Literal["all", "raw"] = "all"     # korekta świec o splity/dywidendy
+    dir: str = "runtime/backtests"
+    cache_dir: str = "runtime/cache"
+    # Granica wiedzy modeli. LLM wolno odtwarzać WYŁĄCZNIE na danych po tej dacie + bufor
+    # (inaczej look-ahead bias). Model spoza tej listy = odmowa replayu LLM.
+    llm_knowledge_cutoff: dict[str, date] = {}
+    llm_cutoff_buffer_days: int = Field(14, ge=0)
+
+    def llm_not_before(self, model: str) -> date | None:
+        cutoff = self.llm_knowledge_cutoff.get(model)
+        return None if cutoff is None else cutoff + timedelta(days=self.llm_cutoff_buffer_days)
+
+
 class AppConfig(_Strict):
     experiment: ExperimentCfg
     watchlist: list[str]
@@ -130,6 +151,7 @@ class AppConfig(_Strict):
     execution: ExecutionCfg = ExecutionCfg()
     storage: StorageCfg = StorageCfg()
     report: ReportCfg = ReportCfg()
+    backtest: BacktestCfg = BacktestCfg()
 
     @field_validator("watchlist")
     @classmethod
